@@ -1,0 +1,26 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# Ignore Gradle build output directory
+build
+
+# Ignore Kotlin plugin data
+.kotlin
+
+myAssets
+
+notes.txt
+
+local.properties
+
+fastlane/report.xml
+
+fastlane/fastlane/metadata
+
+key.properties
+
+*.jks
+
+*.keystore
+
+play-service-account.json

@@ -1,0 +1,479 @@
+﻿package com.skylarkin.evfinder
+
+import android.net.Uri
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.Locale
+import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
+
+class OpenChargeMapClient(
+    private val apiKey: String,
+    private val irishPricingCatalog: IrishPricingCatalog? = null,
+    private val fxRateProvider: FxRateProvider = NoOpFxRateProvider
+) {
+    private companion object {
+        const val SEARCH_RADIUS_KM = 50.0
+        const val BBOX_GRID_SIZE = 3
+        const val BBOX_MAX_RESULTS = 300
+        const val IRELAND_NORTH = 55.43
+        const val IRELAND_SOUTH = 51.39
+        const val IRELAND_WEST = -10.56
+        const val IRELAND_EAST = -5.34
+    }
+
+    private data class PricingInfo(
+        val displayText: String,
+        val euroPerKwh: Double?
+    )
+    private data class BoundingBox(
+        val north: Double,
+        val south: Double,
+        val west: Double,
+        val east: Double
+    )
+
+    suspend fun findMatchingChargePoints(latitude: Double, longitude: Double, maxPriceEuroPerKwh: Double): List<ChargePoint> {
+        return withContext(Dispatchers.Default) {
+            val gbpToEurRate = runCatching { fxRateProvider.getRate("GBP", "EUR") }.getOrNull()
+            val json = fetchPoi(latitude, longitude)
+            parseAndFilter(json, latitude, longitude, maxPriceEuroPerKwh, gbpToEurRate)
+                .sortedByDescending { it.distanceKm }
+        }
+    }
+
+    private suspend fun fetchPoi(latitude: Double, longitude: Double): JSONArray = withContext(Dispatchers.IO) {
+        val tiles = buildBoundingBoxTiles(latitude, longitude, SEARCH_RADIUS_KM, BBOX_GRID_SIZE)
+            .mapNotNull { clipToIrelandBounds(it) }
+        val tileResponses = coroutineScope {
+            tiles.map { box ->
+                async {
+                    fetchPoiByBoundingBox(box)
+                }
+            }.awaitAll()
+        }
+
+        val dedupedById = LinkedHashMap<Int, JSONObject>()
+        val withoutId = mutableListOf<JSONObject>()
+
+        for (array in tileResponses) {
+            for (i in 0 until array.length()) {
+                val poi = array.optJSONObject(i) ?: continue
+                val id = poi.optInt("ID", -1)
+                if (id > 0) {
+                    dedupedById.putIfAbsent(id, poi)
+                } else {
+                    withoutId.add(poi)
+                }
+            }
+        }
+
+        val merged = JSONArray()
+        dedupedById.values.forEach { merged.put(it) }
+        withoutId.forEach { merged.put(it) }
+        merged
+    }
+
+    private fun parseAndFilter(
+        array: JSONArray,
+        userLatitude: Double,
+        userLongitude: Double,
+        maxPriceEuroPerKwh: Double,
+        gbpToEurRate: Double?
+    ): List<ChargePoint> {
+        val strictMatches = mutableListOf<ChargePoint>()
+
+        for (index in 0 until array.length()) {
+            val poi = array.optJSONObject(index) ?: continue
+            val addressInfo = poi.optJSONObject("AddressInfo") ?: continue
+            val connections = poi.optJSONArray("Connections") ?: continue
+
+            if (!hasType2Connection(connections)) continue
+
+            val pricingInfo = extractPricingInfo(poi, addressInfo, connections, gbpToEurRate)
+            val parsedEuroCost = pricingInfo.euroPerKwh
+            val isPublic = isPublic24x7(poi)
+
+            if (parsedEuroCost == null || parsedEuroCost > maxPriceEuroPerKwh) continue
+            if (!isPublic) continue
+
+            val id = poi.optInt("ID")
+            val title = addressInfo.optString("Title").ifBlank { "Unnamed chargepoint" }
+            val address = buildAddressLine(addressInfo)
+            val lat = addressInfo.optDouble("Latitude", Double.NaN)
+            val lon = addressInfo.optDouble("Longitude", Double.NaN)
+            val distance = haversineDistanceKm(userLatitude, userLongitude, lat, lon)
+
+            if (lat.isNaN() || lon.isNaN()) continue
+            if (!isInIrelandBounds(lat, lon)) continue
+            if (distance > SEARCH_RADIUS_KM) continue
+
+            val chargePoint = ChargePoint(
+                id = id,
+                name = title,
+                address = address,
+                latitude = lat,
+                longitude = lon,
+                distanceKm = distance,
+                usageCost = pricingInfo.displayText,
+                accessSummary = if (isPublic) "Public (hours not always published)" else "Access type unknown",
+                directionCode = bearingToDirectionCode(
+                    fromLat = userLatitude,
+                    fromLon = userLongitude,
+                    toLat = lat,
+                    toLon = lon
+                )
+            )
+
+            if (isPublic && parsedEuroCost <= maxPriceEuroPerKwh) {
+                strictMatches.add(chargePoint.copy(accessSummary = "Public 24/7 - within price cap"))
+            }
+        }
+
+        return strictMatches
+    }
+
+    private fun extractPricingInfo(
+        poi: JSONObject,
+        addressInfo: JSONObject,
+        connections: JSONArray,
+        gbpToEurRate: Double?
+    ): PricingInfo {
+        val primaryCandidates = mutableListOf<String>()
+        val fallbackCandidates = mutableListOf<String>()
+
+        poi.optString("UsageCost", "").trim().takeIf { it.isNotBlank() }?.let { primaryCandidates.add(it) }
+
+        for (i in 0 until connections.length()) {
+            val connection = connections.optJSONObject(i) ?: continue
+            connection.optString("UsageCost", "").trim().takeIf { it.isNotBlank() }?.let { primaryCandidates.add(it) }
+            connection.optString("Comments", "").trim().takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
+        }
+
+        poi.optString("GeneralComments", "").trim().takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
+        poi.optJSONObject("UsageType")?.optString("Title", "")?.trim()?.takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
+
+        val parsed = (primaryCandidates + fallbackCandidates)
+            .asSequence()
+            .mapNotNull { parseEuroCostPerKwh(it) }
+            .firstOrNull()
+
+        if (parsed != null) {
+            return PricingInfo(
+                displayText = "EUR " + String.format(Locale.US, "%.2f", parsed) + "/kWh",
+                euroPerKwh = parsed
+            )
+        }
+
+        val readableRaw = (primaryCandidates + fallbackCandidates)
+            .firstOrNull { looksLikePriceText(it) }
+            ?.let { compactPriceText(it) }
+
+        if (readableRaw != null) {
+            return PricingInfo(readableRaw, null)
+        }
+
+        val operatorName = poi.optJSONObject("OperatorInfo")?.optString("Title", "")?.trim()
+        val siteTitle = addressInfo.optString("Title", "").trim()
+        val inferredPowerKw = inferMaxPowerKw(connections)
+        val inferredCurrentType = inferCurrentType(connections, inferredPowerKw)
+
+        val catalogMatch = irishPricingCatalog?.findBestMatch(
+            operatorName = operatorName,
+            siteTitle = siteTitle,
+            inferredPowerKw = inferredPowerKw,
+            inferredCurrentType = inferredCurrentType,
+            gbpToEurRate = gbpToEurRate
+        )
+
+        if (catalogMatch != null) {
+            val estimate = if (catalogMatch.originalCurrency.equals("GBP", ignoreCase = true)) {
+                val gbpPart = "Est. GBP " + String.format(Locale.US, "%.3f", catalogMatch.originalPricePerKwh) + "/kWh"
+                val eurPart = " (~EUR " + String.format(Locale.US, "%.2f", catalogMatch.euroPerKwh) + "/kWh)"
+                gbpPart + eurPart
+            } else {
+                "Est. EUR " + String.format(Locale.US, "%.2f", catalogMatch.euroPerKwh) + "/kWh"
+            }
+            val source = " (${catalogMatch.operator} ${catalogMatch.chargerType}, ${catalogMatch.confidence})"
+            return PricingInfo(estimate + source, catalogMatch.euroPerKwh)
+        }
+
+        return PricingInfo("Price unknown", null)
+    }
+
+    private fun hasType2Connection(connections: JSONArray): Boolean {
+        for (i in 0 until connections.length()) {
+            val connection = connections.optJSONObject(i) ?: continue
+            val connectionType = connection.optJSONObject("ConnectionType")
+            val title = connectionType?.optString("Title", "") ?: ""
+            if (title.contains("type 2", ignoreCase = true)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun parseEuroCostPerKwh(rawText: String): Double? {
+        if (rawText.isBlank()) return null
+
+        val normalized = normalizePriceText(rawText)
+        val lower = normalized.lowercase(Locale.US)
+
+        if (containsFreePricing(lower)) return 0.0
+
+        val hasUsd = lower.contains("$") || lower.contains("usd")
+        val hasGbp = lower.contains("\u00a3") || lower.contains("gbp")
+        val hasEur = lower.contains("\u20ac") || lower.contains("eur")
+
+        if ((hasUsd || hasGbp) && !hasEur) return null
+
+        val centMatch = Regex("(\\d+[\\.,]?\\d*)\\s*(?:c|cent|\\u00a2)\\s*(?:/|per)?\\s*kwh").find(lower)
+        if (centMatch != null) {
+            val cents = centMatch.groupValues[1].replace(',', '.').toDoubleOrNull() ?: return null
+            return if (cents >= 0.0) cents / 100.0 else null
+        }
+
+        val euroMatch = Regex("(\\d+[\\.,]?\\d*)\\s*(?:\\u20ac|eur)?\\s*(?:/|per)?\\s*kwh").find(lower)
+            ?: Regex("(?:/|per)\\s*kwh\\s*(\\d+[\\.,]?\\d*)").find(lower)
+
+        val rawValue = euroMatch?.groupValues?.lastOrNull()?.replace(',', '.') ?: return null
+        val parsed = rawValue.toDoubleOrNull() ?: return null
+
+        if (parsed <= 0.0) return null
+
+        return if (parsed >= 2.0 && !hasEur) parsed / 100.0 else parsed
+    }
+
+    private fun containsFreePricing(text: String): Boolean {
+        return text.contains("free") || text.contains("no charge") || text.contains("complimentary") || text.contains("gratis")
+    }
+
+    private fun looksLikePriceText(text: String): Boolean {
+        val lower = text.lowercase(Locale.US)
+        return lower.contains("kwh") ||
+            lower.contains("price") ||
+            lower.contains("cost") ||
+            lower.contains("tariff") ||
+            containsFreePricing(lower)
+    }
+
+    private fun compactPriceText(text: String): String {
+        val compact = text.replace(Regex("\\s+"), " ").trim()
+        return if (compact.length > 72) compact.take(69) + "..." else compact
+    }
+
+    private fun fetchPoiByBoundingBox(box: BoundingBox): JSONArray {
+        val topLeft = "(" + formatCoordinate(box.north) + "," + formatCoordinate(box.west) + ")"
+        val bottomRight = "(" + formatCoordinate(box.south) + "," + formatCoordinate(box.east) + ")"
+        val boundingBox = "$topLeft,$bottomRight"
+
+        val url = Uri.parse("https://api.openchargemap.io/v3/poi")
+            .buildUpon()
+            .appendQueryParameter("output", "json")
+            .appendQueryParameter("boundingbox", boundingBox)
+            .appendQueryParameter("maxresults", BBOX_MAX_RESULTS.toString())
+            .appendQueryParameter("compact", "false")
+            .appendQueryParameter("verbose", "false")
+            .build()
+            .toString()
+
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("X-API-Key", apiKey)
+            setRequestProperty("X-Requestor", "Skylarkin-EV-Finder")
+            connectTimeout = 15_000
+            readTimeout = 15_000
+        }
+
+        return try {
+            val stream = if (connection.responseCode in 200..299) {
+                connection.inputStream
+            } else {
+                connection.errorStream
+            }
+
+            val response = stream.bufferedReader().use(BufferedReader::readText)
+
+            if (connection.responseCode !in 200..299) {
+                throw IllegalStateException("API error ${connection.responseCode}: $response")
+            }
+
+            JSONArray(response)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun buildBoundingBoxTiles(latitude: Double, longitude: Double, radiusKm: Double, gridSize: Int): List<BoundingBox> {
+        val latDelta = radiusKm / 110.574
+        val cosLat = cos(Math.toRadians(latitude)).coerceAtLeast(0.1)
+        val lonDelta = radiusKm / (111.320 * cosLat)
+
+        val north = latitude + latDelta
+        val south = latitude - latDelta
+        val west = longitude - lonDelta
+        val east = longitude + lonDelta
+
+        val tileLat = (north - south) / gridSize
+        val tileLon = (east - west) / gridSize
+
+        val boxes = mutableListOf<BoundingBox>()
+        for (row in 0 until gridSize) {
+            val tileNorth = north - (row * tileLat)
+            val tileSouth = tileNorth - tileLat
+            for (col in 0 until gridSize) {
+                val tileWest = west + (col * tileLon)
+                val tileEast = tileWest + tileLon
+                boxes.add(
+                    BoundingBox(
+                        north = tileNorth,
+                        south = tileSouth,
+                        west = tileWest,
+                        east = tileEast
+                    )
+                )
+            }
+        }
+        return boxes
+    }
+
+    private fun formatCoordinate(value: Double): String = String.format(Locale.US, "%.7f", value)
+
+    private fun clipToIrelandBounds(box: BoundingBox): BoundingBox? {
+        val north = min(box.north, IRELAND_NORTH)
+        val south = max(box.south, IRELAND_SOUTH)
+        val west = max(box.west, IRELAND_WEST)
+        val east = min(box.east, IRELAND_EAST)
+        if (north <= south || east <= west) return null
+        return BoundingBox(north = north, south = south, west = west, east = east)
+    }
+
+    private fun isInIrelandBounds(lat: Double, lon: Double): Boolean {
+        return lat in IRELAND_SOUTH..IRELAND_NORTH && lon in IRELAND_WEST..IRELAND_EAST
+    }
+
+    private fun bearingToDirectionCode(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): String {
+        if (fromLat.isNaN() || fromLon.isNaN()) return "N"
+        val bearing = computeBearingDegrees(fromLat, fromLon, toLat, toLon)
+        val normalized = (bearing + 360.0) % 360.0
+        val sector = ((normalized + 11.25) / 22.5).toInt() % 16
+        return listOf("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW")[sector]
+    }
+
+    private fun computeBearingDegrees(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): Double {
+        val fromLatRad = Math.toRadians(fromLat)
+        val toLatRad = Math.toRadians(toLat)
+        val deltaLonRad = Math.toRadians(toLon - fromLon)
+
+        val y = kotlin.math.sin(deltaLonRad) * kotlin.math.cos(toLatRad)
+        val x = kotlin.math.cos(fromLatRad) * kotlin.math.sin(toLatRad) -
+            kotlin.math.sin(fromLatRad) * kotlin.math.cos(toLatRad) * kotlin.math.cos(deltaLonRad)
+
+        return Math.toDegrees(kotlin.math.atan2(y, x))
+    }
+
+    private fun haversineDistanceKm(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): Double {
+        val earthRadiusKm = 6371.0
+        val dLat = Math.toRadians(toLat - fromLat)
+        val dLon = Math.toRadians(toLon - fromLon)
+        val lat1 = Math.toRadians(fromLat)
+        val lat2 = Math.toRadians(toLat)
+
+        val a = kotlin.math.sin(dLat / 2).pow(2.0) +
+            kotlin.math.sin(dLon / 2).pow(2.0) * kotlin.math.cos(lat1) * kotlin.math.cos(lat2)
+        val c = 2 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
+        return earthRadiusKm * c
+    }
+
+    private fun inferMaxPowerKw(connections: JSONArray): Double? {
+        var maxPower: Double? = null
+        for (i in 0 until connections.length()) {
+            val connection = connections.optJSONObject(i) ?: continue
+            val power = connection.optDouble("PowerKW", Double.NaN)
+            if (!power.isNaN()) {
+                maxPower = if (maxPower == null) power else maxOf(maxPower, power)
+            }
+        }
+        return maxPower
+    }
+
+    private fun inferCurrentType(connections: JSONArray, inferredPowerKw: Double?): String {
+        for (i in 0 until connections.length()) {
+            val connection = connections.optJSONObject(i) ?: continue
+            val currentTypeTitle = connection.optJSONObject("CurrentType")?.optString("Title", "")?.lowercase(Locale.US).orEmpty()
+            if (currentTypeTitle.contains("dc")) {
+                return if ((inferredPowerKw ?: 0.0) >= 150.0) "hpc" else "dc"
+            }
+            if (currentTypeTitle.contains("ac")) {
+                return "ac"
+            }
+        }
+
+        return when {
+            (inferredPowerKw ?: 0.0) >= 150.0 -> "hpc"
+            (inferredPowerKw ?: 0.0) > 22.0 -> "dc"
+            else -> "ac"
+        }
+    }
+
+    private fun normalizePriceText(text: String): String {
+        return text
+            .replace("\u00e2\u201a\u00ac", "\u20ac")
+            .replace("\u00c2\u00a3", "\u00a3")
+            .replace("\u00e2\u0082\u00ac", "\u20ac")
+    }
+
+    private fun isPublic24x7(poi: JSONObject): Boolean {
+        val usageType = poi.optJSONObject("UsageType")
+        val usageTitle = usageType?.optString("Title", "") ?: ""
+        val usageTypeId = poi.optInt("UsageTypeID", 0)
+        val usageText = usageTitle.lowercase()
+
+        val likelyPublic = usageText.contains("public") || usageTypeId in setOf(1, 4, 5, 6, 7)
+        if (!likelyPublic) return false
+
+        val isMembershipRequired = usageType?.optBoolean("IsMembershipRequired", false) ?: false
+        val isAccessKeyRequired = usageType?.optBoolean("IsAccessKeyRequired", false) ?: false
+        if (isMembershipRequired || isAccessKeyRequired) return false
+
+        val statusType = poi.optJSONObject("StatusType")
+        val statusTitle = statusType?.optString("Title", "") ?: ""
+        if (statusTitle.contains("planned", ignoreCase = true)) return false
+
+        val comments = listOf(
+            poi.optString("GeneralComments", ""),
+            usageTitle
+        ).joinToString(" ").lowercase()
+
+        val likelyAlwaysOpen = comments.contains("24/7") ||
+            comments.contains("24h") ||
+            comments.contains("24 hours") ||
+            !comments.contains("hours")
+
+        return likelyAlwaysOpen
+    }
+
+    private fun buildAddressLine(addressInfo: JSONObject): String {
+        val parts = listOf(
+            addressInfo.optString("AddressLine1", ""),
+            addressInfo.optString("Town", ""),
+            addressInfo.optString("StateOrProvince", ""),
+            addressInfo.optString("Postcode", "")
+        )
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+
+        return if (parts.isEmpty()) "Address unavailable" else parts.joinToString(", ")
+    }
+}

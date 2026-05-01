@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="app_bg">#F4F6F7</color>
+    <color name="card_bg">#FFFFFF</color>
+    <color name="card_stroke">#D2DDE3</color>
+    <color name="title_text">#0E2A3A</color>
+    <color name="subtitle_text">#395264</color>
+    <color name="status_text">#3F5F74</color>
+    <color name="meta_text">#1A6A41</color>
+    <color name="primary">#006C67</color>
+    <color name="primary_variant">#00504C</color>
+</resources>

@@ -1,0 +1,54 @@
+require "fileutils"
+
+default_platform(:android)
+
+platform :android do
+  lane :internal do
+    current_code = android_get_version_code(gradle_file: "app/build.gradle.kts").to_i
+    next_code = current_code + 1
+    android_set_version_code(
+      version_code: next_code,
+      gradle_file: "app/build.gradle.kts"
+    )
+
+    current_name = android_get_version_name(gradle_file: "app/build.gradle.kts")
+    parts = current_name.split(".").map(&:to_i)
+    parts[-1] = parts[-1].to_i + 1
+    android_set_version_name(
+      version_name: parts.join("."),
+      gradle_file: "app/build.gradle.kts"
+    )
+
+    release_note = UI.input("Release note for internal track:")
+    changelog_dir = "fastlane/metadata/android/en-US/changelogs"
+    FileUtils.mkdir_p(changelog_dir)
+    File.write("#{changelog_dir}/#{next_code}.txt", release_note)
+
+    gradle(task: "bundle", build_type: "Release")
+
+    upload_to_play_store(
+      package_name: "com.skylarkin.evfinder",
+      json_key: ENV["PLAY_JSON_KEY"],
+      aab: "app/build/outputs/bundle/release/app-release.aab",
+      skip_upload_apk: true,
+      track: "internal",
+      release_status: "draft",
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      skip_upload_changelogs: false
+    )
+  end
+
+  lane :ias do
+    gradle(task: "bundle", build_type: "Release")
+
+    url = upload_to_play_store_internal_app_sharing(
+      package_name: "com.skylarkin.evfinder",
+      json_key: ENV["PLAY_JSON_KEY"],
+      aab: "app/build/outputs/bundle/release/app-release.aab"
+    )
+
+    UI.message("Internal App Sharing URL: #{url}")
+  end
+end
