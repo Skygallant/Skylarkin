@@ -15,7 +15,7 @@ local.properties
 
 fastlane/report.xml
 
-fastlane/fastlane/metadata
+fastlane/metadata
 
 key.properties
 

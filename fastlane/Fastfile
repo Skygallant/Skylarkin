@@ -19,9 +19,14 @@ platform :android do
       gradle_file: "app/build.gradle.kts"
     )
 
-    release_note = UI.input("Release note for internal track:")
+    release_note = UI.input("Release note for internal track:").to_s.strip
+    if release_note.empty?
+      release_note = "Internal build #{next_code}"
+    end
+
+    metadata_android_path = File.expand_path("metadata/android", __dir__)
     ["en-GB", "en-US"].each do |locale|
-      changelog_dir = "fastlane/metadata/android/#{locale}/changelogs"
+      changelog_dir = File.join(metadata_android_path, locale, "changelogs")
       FileUtils.mkdir_p(changelog_dir)
       File.write("#{changelog_dir}/#{next_code}.txt", release_note)
     end
@@ -35,6 +40,7 @@ platform :android do
       skip_upload_apk: true,
       track: "internal",
       release_status: "completed",
+      metadata_path: metadata_android_path,
       skip_upload_metadata: true,
       skip_upload_images: true,
       skip_upload_screenshots: true,

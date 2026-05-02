@@ -29,13 +29,7 @@ import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
-import java.io.BufferedReader
 import java.util.Locale
-import kotlin.math.atan2
-import kotlin.math.cos
-import kotlin.math.pow
-import kotlin.math.sin
-import kotlin.math.sqrt
 
 class SkylarkinQuickLaunchScreen(
     carContext: CarContext
@@ -43,25 +37,18 @@ class SkylarkinQuickLaunchScreen(
 
     private companion object {
         const val MAX_PRICE_EUR_PER_KWH = 0.50
-        const val APPLEGREEN_ASSET_FILE = "applegreen_roi_motorway_service_stations_best_effort.csv"
     }
-
-    private data class ApplegreenSite(
-        val name: String,
-        val latitude: Double,
-        val longitude: Double
-    )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val chargeMapClient: OpenChargeMapClient
+    private val sleepSpotClient = OsmSleepSpotClient()
 
-    private var isLoading = true
+    private var isLoading = false
     private var errorMessage: String? = null
     private var matches: List<ChargePoint> = emptyList()
     private var csvOnly = true
     private var lastKnownLocation: Location? = null
     private var pendingDirectionLaunch: String? = null
-    private val applegreenSites: List<ApplegreenSite> by lazy { loadApplegreenSites() }
 
     init {
         val pricingCatalog = runCatching { IrishPricingCatalog.fromAssets(carContext) }.getOrNull()
@@ -75,7 +62,6 @@ class SkylarkinQuickLaunchScreen(
                 scope.cancel()
             }
         })
-        reloadMatches()
     }
 
     override fun onGetTemplate(): Template {
@@ -119,17 +105,15 @@ class SkylarkinQuickLaunchScreen(
                 .build()
         }
 
-        val candidates = filteredCandidates()
         val listBuilder = ItemList.Builder()
 
-        listBuilder.addItem(directionRow("N", candidates))
-        listBuilder.addItem(directionRow("S", candidates))
-        listBuilder.addItem(directionRow("E", candidates))
-        listBuilder.addItem(directionRow("W", candidates))
+        listBuilder.addItem(directionRow("N"))
+        listBuilder.addItem(directionRow("S"))
+        listBuilder.addItem(directionRow("E"))
+        listBuilder.addItem(directionRow("W"))
         listBuilder.addItem(
             Row.Builder()
                 .setTitle("CSV pricing only")
-                .addText("Exclude chargers not matched by pricing CSV")
                 .setToggle(
                     Toggle.Builder { isChecked ->
                         csvOnly = isChecked
@@ -221,8 +205,7 @@ class SkylarkinQuickLaunchScreen(
         return source.filter { it.usageCost.startsWith("Est.", ignoreCase = true) }
     }
 
-    private fun directionRow(cardinal: String, candidates: List<ChargePoint>): Row {
-        val directionMatches = candidates.filter { matchesGeneralDirection(it.directionCode, cardinal) }
+    private fun directionRow(cardinal: String): Row {
         val directionLabel = when (cardinal) {
             "N" -> "North"
             "S" -> "South"
@@ -232,7 +215,6 @@ class SkylarkinQuickLaunchScreen(
         }
         return Row.Builder()
             .setTitle(directionLabel)
-            .addText("${directionMatches.size} matches")
             .setOnClickListener {
                 pendingDirectionLaunch = cardinal
                 reloadMatches()
@@ -258,21 +240,11 @@ class SkylarkinQuickLaunchScreen(
     private fun sleepRow(): Row {
         return Row.Builder()
             .setTitle("Sleep")
-            .addText("Navigate to nearest Applegreen service station")
             .setOnClickListener { startSleepNavigation() }
             .build()
     }
 
     private fun startSleepNavigation() {
-        if (applegreenSites.isEmpty()) {
-            CarToast.makeText(
-                carContext,
-                "No Applegreen stations available in CSV.",
-                CarToast.LENGTH_SHORT
-            ).show()
-            return
-        }
-
         scope.launch {
             val location = lastKnownLocation ?: awaitLastLocation()
             if (location == null) {
@@ -287,12 +259,20 @@ class SkylarkinQuickLaunchScreen(
             }
 
             lastKnownLocation = location
-            val nearest = applegreenSites.minByOrNull {
-                haversineDistanceKm(location.latitude, location.longitude, it.latitude, it.longitude)
-            } ?: return@launch
+            val nearest = runCatching {
+                sleepSpotClient.findNearestSleepSpot(location.latitude, location.longitude)
+            }.getOrNull()
 
             carContext.mainExecutor.execute {
-                navigateToCoordinates(nearest.latitude, nearest.longitude, nearest.name)
+                if (nearest == null) {
+                    CarToast.makeText(
+                        carContext,
+                        "No OSM sleep spot matched (free, overnight, year-round, shower).",
+                        CarToast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    navigateToCoordinates(nearest.latitude, nearest.longitude, nearest.name)
+                }
             }
         }
     }
@@ -323,78 +303,5 @@ class SkylarkinQuickLaunchScreen(
             "W" -> code in setOf("W", "WNW", "WSW", "NW", "SW")
             else -> false
         }
-    }
-
-    private fun loadApplegreenSites(): List<ApplegreenSite> {
-        return runCatching {
-            carContext.assets.open(APPLEGREEN_ASSET_FILE).bufferedReader().use { reader ->
-                parseApplegreenCsv(reader)
-            }
-        }.getOrDefault(emptyList())
-    }
-
-    private fun parseApplegreenCsv(reader: BufferedReader): List<ApplegreenSite> {
-        val lines = reader.readLines()
-        if (lines.isEmpty()) return emptyList()
-
-        val header = parseCsvLine(lines.first())
-        val index = header.withIndex().associate { it.value.trim().lowercase(Locale.US) to it.index }
-
-        fun field(columns: List<String>, key: String): String {
-            val i = index[key] ?: return ""
-            return columns.getOrNull(i)?.trim().orEmpty()
-        }
-
-        return lines.drop(1)
-            .asSequence()
-            .filter { it.isNotBlank() }
-            .map { parseCsvLine(it) }
-            .mapNotNull { columns ->
-                val name = field(columns, "site_name").ifBlank { "Applegreen" }
-                val lat = field(columns, "latitude").toDoubleOrNull() ?: return@mapNotNull null
-                val lon = field(columns, "longitude").toDoubleOrNull() ?: return@mapNotNull null
-                ApplegreenSite(name = name, latitude = lat, longitude = lon)
-            }
-            .toList()
-    }
-
-    private fun parseCsvLine(line: String): List<String> {
-        val result = mutableListOf<String>()
-        val current = StringBuilder()
-        var inQuotes = false
-        var i = 0
-        while (i < line.length) {
-            val c = line[i]
-            when {
-                c == '"' -> {
-                    if (inQuotes && i + 1 < line.length && line[i + 1] == '"') {
-                        current.append('"')
-                        i++
-                    } else {
-                        inQuotes = !inQuotes
-                    }
-                }
-                c == ',' && !inQuotes -> {
-                    result.add(current.toString())
-                    current.clear()
-                }
-                else -> current.append(c)
-            }
-            i++
-        }
-        result.add(current.toString())
-        return result
-    }
-
-    private fun haversineDistanceKm(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): Double {
-        val earthRadiusKm = 6371.0
-        val dLat = Math.toRadians(toLat - fromLat)
-        val dLon = Math.toRadians(toLon - fromLon)
-        val lat1 = Math.toRadians(fromLat)
-        val lat2 = Math.toRadians(toLat)
-
-        val a = sin(dLat / 2).pow(2.0) + sin(dLon / 2).pow(2.0) * cos(lat1) * cos(lat2)
-        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
-        return earthRadiusKm * c
     }
 }
