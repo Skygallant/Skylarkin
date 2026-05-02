@@ -20,9 +20,11 @@ platform :android do
     )
 
     release_note = UI.input("Release note for internal track:")
-    changelog_dir = "fastlane/metadata/android/en-US/changelogs"
-    FileUtils.mkdir_p(changelog_dir)
-    File.write("#{changelog_dir}/#{next_code}.txt", release_note)
+    ["en-GB", "en-US"].each do |locale|
+      changelog_dir = "fastlane/metadata/android/#{locale}/changelogs"
+      FileUtils.mkdir_p(changelog_dir)
+      File.write("#{changelog_dir}/#{next_code}.txt", release_note)
+    end
 
     gradle(task: "bundle", build_type: "Release")
 
@@ -32,7 +34,7 @@ platform :android do
       aab: "app/build/outputs/bundle/release/app-release.aab",
       skip_upload_apk: true,
       track: "internal",
-      release_status: "draft",
+      release_status: "completed",
       skip_upload_metadata: true,
       skip_upload_images: true,
       skip_upload_screenshots: true,
