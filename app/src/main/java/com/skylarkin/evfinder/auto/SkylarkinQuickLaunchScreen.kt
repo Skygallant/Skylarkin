@@ -29,7 +29,13 @@ import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import java.io.BufferedReader
 import java.util.Locale
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 class SkylarkinQuickLaunchScreen(
     carContext: CarContext
@@ -37,7 +43,14 @@ class SkylarkinQuickLaunchScreen(
 
     private companion object {
         const val MAX_PRICE_EUR_PER_KWH = 0.50
+        const val APPLEGREEN_ASSET_FILE = "applegreen_roi_motorway_service_stations_best_effort.csv"
     }
+
+    private data class ApplegreenSite(
+        val name: String,
+        val latitude: Double,
+        val longitude: Double
+    )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val chargeMapClient: OpenChargeMapClient
@@ -46,6 +59,9 @@ class SkylarkinQuickLaunchScreen(
     private var errorMessage: String? = null
     private var matches: List<ChargePoint> = emptyList()
     private var csvOnly = true
+    private var lastKnownLocation: Location? = null
+    private var pendingDirectionLaunch: String? = null
+    private val applegreenSites: List<ApplegreenSite> by lazy { loadApplegreenSites() }
 
     init {
         val pricingCatalog = runCatching { IrishPricingCatalog.fromAssets(carContext) }.getOrNull()
@@ -106,6 +122,10 @@ class SkylarkinQuickLaunchScreen(
         val candidates = filteredCandidates()
         val listBuilder = ItemList.Builder()
 
+        listBuilder.addItem(directionRow("N", candidates))
+        listBuilder.addItem(directionRow("S", candidates))
+        listBuilder.addItem(directionRow("E", candidates))
+        listBuilder.addItem(directionRow("W", candidates))
         listBuilder.addItem(
             Row.Builder()
                 .setTitle("CSV pricing only")
@@ -120,17 +140,7 @@ class SkylarkinQuickLaunchScreen(
                 )
                 .build()
         )
-
-        listBuilder.addItem(directionRow("N", candidates))
-        listBuilder.addItem(directionRow("S", candidates))
-        listBuilder.addItem(directionRow("E", candidates))
-        listBuilder.addItem(directionRow("W", candidates))
-        listBuilder.addItem(
-            Row.Builder()
-                .setTitle("Refresh chargers")
-                .setOnClickListener { reloadMatches() }
-                .build()
-        )
+        listBuilder.addItem(sleepRow())
 
         return ListTemplate.Builder()
             .setHeader(
@@ -152,6 +162,7 @@ class SkylarkinQuickLaunchScreen(
             runCatching {
                 val location = awaitLastLocation()
                     ?: throw IllegalStateException("Current location is unavailable.")
+                lastKnownLocation = location
                 chargeMapClient.findMatchingChargePoints(
                     latitude = location.latitude,
                     longitude = location.longitude,
@@ -162,6 +173,11 @@ class SkylarkinQuickLaunchScreen(
                     isLoading = false
                     errorMessage = null
                     matches = loaded
+                    val pending = pendingDirectionLaunch
+                    if (pending != null) {
+                        pendingDirectionLaunch = null
+                        launchDirectionFromMatches(pending, loaded)
+                    }
                     invalidate()
                 }
             }.onFailure { error ->
@@ -197,38 +213,102 @@ class SkylarkinQuickLaunchScreen(
     }
 
     private fun filteredCandidates(): List<ChargePoint> {
-        if (!csvOnly) return matches
-        return matches.filter { it.usageCost.startsWith("Est.", ignoreCase = true) }
+        return filteredCandidates(matches)
+    }
+
+    private fun filteredCandidates(source: List<ChargePoint>): List<ChargePoint> {
+        if (!csvOnly) return source
+        return source.filter { it.usageCost.startsWith("Est.", ignoreCase = true) }
     }
 
     private fun directionRow(cardinal: String, candidates: List<ChargePoint>): Row {
         val directionMatches = candidates.filter { matchesGeneralDirection(it.directionCode, cardinal) }
+        val directionLabel = when (cardinal) {
+            "N" -> "North"
+            "S" -> "South"
+            "E" -> "East"
+            "W" -> "West"
+            else -> cardinal
+        }
         return Row.Builder()
-            .setTitle("Launch $cardinal")
+            .setTitle(directionLabel)
             .addText("${directionMatches.size} matches")
             .setOnClickListener {
-                val farthest = directionMatches.maxByOrNull { it.distanceKm }
-                if (farthest == null) {
-                    CarToast.makeText(
-                        carContext,
-                        "No matching chargers for $cardinal.",
-                        CarToast.LENGTH_SHORT
-                    ).show()
-                } else {
-                    navigateToChargePoint(farthest)
-                }
+                pendingDirectionLaunch = cardinal
+                reloadMatches()
             }
             .build()
     }
 
+    private fun launchDirectionFromMatches(cardinal: String, sourceMatches: List<ChargePoint>) {
+        val candidates = filteredCandidates(sourceMatches)
+        val directionMatches = candidates.filter { matchesGeneralDirection(it.directionCode, cardinal) }
+        val farthest = directionMatches.maxByOrNull { it.distanceKm }
+        if (farthest == null) {
+            CarToast.makeText(
+                carContext,
+                "No matching chargers for $cardinal.",
+                CarToast.LENGTH_SHORT
+            ).show()
+        } else {
+            navigateToChargePoint(farthest)
+        }
+    }
+
+    private fun sleepRow(): Row {
+        return Row.Builder()
+            .setTitle("Sleep")
+            .addText("Navigate to nearest Applegreen service station")
+            .setOnClickListener { startSleepNavigation() }
+            .build()
+    }
+
+    private fun startSleepNavigation() {
+        if (applegreenSites.isEmpty()) {
+            CarToast.makeText(
+                carContext,
+                "No Applegreen stations available in CSV.",
+                CarToast.LENGTH_SHORT
+            ).show()
+            return
+        }
+
+        scope.launch {
+            val location = lastKnownLocation ?: awaitLastLocation()
+            if (location == null) {
+                carContext.mainExecutor.execute {
+                    CarToast.makeText(
+                        carContext,
+                        "Current location unavailable.",
+                        CarToast.LENGTH_SHORT
+                    ).show()
+                }
+                return@launch
+            }
+
+            lastKnownLocation = location
+            val nearest = applegreenSites.minByOrNull {
+                haversineDistanceKm(location.latitude, location.longitude, it.latitude, it.longitude)
+            } ?: return@launch
+
+            carContext.mainExecutor.execute {
+                navigateToCoordinates(nearest.latitude, nearest.longitude, nearest.name)
+            }
+        }
+    }
+
     private fun navigateToChargePoint(target: ChargePoint) {
-        val uri = Uri.parse("geo:${target.latitude},${target.longitude}")
+        navigateToCoordinates(target.latitude, target.longitude, target.name)
+    }
+
+    private fun navigateToCoordinates(latitude: Double, longitude: Double, label: String) {
+        val uri = Uri.parse("geo:$latitude,$longitude")
         val navIntent = Intent(CarContext.ACTION_NAVIGATE, uri)
         runCatching { carContext.startCarApp(navIntent) }
             .onFailure {
                 CarToast.makeText(
                     carContext,
-                    "Could not open navigation for ${target.name}.",
+                    "Could not open navigation for $label.",
                     CarToast.LENGTH_SHORT
                 ).show()
             }
@@ -243,5 +323,78 @@ class SkylarkinQuickLaunchScreen(
             "W" -> code in setOf("W", "WNW", "WSW", "NW", "SW")
             else -> false
         }
+    }
+
+    private fun loadApplegreenSites(): List<ApplegreenSite> {
+        return runCatching {
+            carContext.assets.open(APPLEGREEN_ASSET_FILE).bufferedReader().use { reader ->
+                parseApplegreenCsv(reader)
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun parseApplegreenCsv(reader: BufferedReader): List<ApplegreenSite> {
+        val lines = reader.readLines()
+        if (lines.isEmpty()) return emptyList()
+
+        val header = parseCsvLine(lines.first())
+        val index = header.withIndex().associate { it.value.trim().lowercase(Locale.US) to it.index }
+
+        fun field(columns: List<String>, key: String): String {
+            val i = index[key] ?: return ""
+            return columns.getOrNull(i)?.trim().orEmpty()
+        }
+
+        return lines.drop(1)
+            .asSequence()
+            .filter { it.isNotBlank() }
+            .map { parseCsvLine(it) }
+            .mapNotNull { columns ->
+                val name = field(columns, "site_name").ifBlank { "Applegreen" }
+                val lat = field(columns, "latitude").toDoubleOrNull() ?: return@mapNotNull null
+                val lon = field(columns, "longitude").toDoubleOrNull() ?: return@mapNotNull null
+                ApplegreenSite(name = name, latitude = lat, longitude = lon)
+            }
+            .toList()
+    }
+
+    private fun parseCsvLine(line: String): List<String> {
+        val result = mutableListOf<String>()
+        val current = StringBuilder()
+        var inQuotes = false
+        var i = 0
+        while (i < line.length) {
+            val c = line[i]
+            when {
+                c == '"' -> {
+                    if (inQuotes && i + 1 < line.length && line[i + 1] == '"') {
+                        current.append('"')
+                        i++
+                    } else {
+                        inQuotes = !inQuotes
+                    }
+                }
+                c == ',' && !inQuotes -> {
+                    result.add(current.toString())
+                    current.clear()
+                }
+                else -> current.append(c)
+            }
+            i++
+        }
+        result.add(current.toString())
+        return result
+    }
+
+    private fun haversineDistanceKm(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): Double {
+        val earthRadiusKm = 6371.0
+        val dLat = Math.toRadians(toLat - fromLat)
+        val dLon = Math.toRadians(toLon - fromLon)
+        val lat1 = Math.toRadians(fromLat)
+        val lat2 = Math.toRadians(toLat)
+
+        val a = sin(dLat / 2).pow(2.0) + sin(dLon / 2).pow(2.0) * cos(lat1) * cos(lat2)
+        val c = 2 * atan2(sqrt(a), sqrt(1 - a))
+        return earthRadiusKm * c
     }
 }
