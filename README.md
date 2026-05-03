@@ -1,6 +1,6 @@
 ## Playstore page description
 
-The idea was to have something I could use to base my adventures, from a "Where am I going to charge my car when I get there?" perspective. The app uses the OCM API with static pricing databases, so inaccuracies are to be expected. OSRM API is used to check whether you'd need a ferry to reach the chargepoints, and to drop them from the search if you do. Importantly, the static pricing databases only cover the Island of Ireland (Republic plus Northern), so chargepoint prices elsewhere rely solely on the OCM API. All prices are converted to Euro.
+The idea was to have something I could use to base my adventures, from a "Where am I going to charge my car when I get there?" perspective. The app uses the OCM API with static pricing databases, so inaccuracies are to be expected. OSRM API is used to check whether you'd need a ferry to reach the chargepoints, and to drop them from the search if you do. Importantly, the static pricing databases only cover the Island of Ireland (Republic plus Northern), so chargepoint prices elsewhere rely solely on the OCM API.
 
 This app is also intended to work with Android Auto; a simplified version of the UI will be available on the car's infotainment system. It will automatically plot a destination to the farthest charge point within 50km (50km is currently hardcoded). However, you select a cardinal direction to give the app a general idea of where to look.
 
