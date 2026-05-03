@@ -15,9 +15,9 @@ import androidx.car.app.model.Template
 import androidx.car.app.model.Toggle
 import com.google.android.gms.location.LocationServices
 import com.skylarkin.evfinder.BuildConfig
+import com.skylarkin.evfinder.ChargetripPricingClient
 import com.skylarkin.evfinder.ChargePoint
 import com.skylarkin.evfinder.FrankfurterFxRateProvider
-import com.skylarkin.evfinder.IrishPricingCatalog
 import com.skylarkin.evfinder.OpenChargeMapClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -46,17 +46,20 @@ class SkylarkinQuickLaunchScreen(
     private var isLoading = false
     private var errorMessage: String? = null
     private var matches: List<ChargePoint> = emptyList()
-    private var csvOnly = true
+    private var chargetripOnly = false
     private var requireShowers = false
     private var lastKnownLocation: Location? = null
     private var pendingDirectionLaunch: String? = null
 
     init {
-        val pricingCatalog = runCatching { IrishPricingCatalog.fromAssets(carContext) }.getOrNull()
         chargeMapClient = OpenChargeMapClient(
             apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY,
-            irishPricingCatalog = pricingCatalog,
-            fxRateProvider = FrankfurterFxRateProvider()
+            fxRateProvider = FrankfurterFxRateProvider(),
+            chargetripPricingClient = ChargetripPricingClient(
+                clientId = BuildConfig.CHARGETRIP_CLIENT_ID,
+                appId = BuildConfig.CHARGETRIP_APP_ID,
+                storageDir = carContext.filesDir
+            )
         )
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
@@ -114,13 +117,13 @@ class SkylarkinQuickLaunchScreen(
         listBuilder.addItem(directionRow("W"))
         listBuilder.addItem(
             Row.Builder()
-                .setTitle("CSV pricing only")
+                .setTitle("Chargetrip pricing only")
                 .setToggle(
                     Toggle.Builder { isChecked ->
-                        csvOnly = isChecked
+                        chargetripOnly = isChecked
                         invalidate()
                     }
-                        .setChecked(csvOnly)
+                        .setChecked(chargetripOnly)
                         .build()
                 )
                 .build()
@@ -203,8 +206,8 @@ class SkylarkinQuickLaunchScreen(
     }
 
     private fun filteredCandidates(source: List<ChargePoint>): List<ChargePoint> {
-        if (!csvOnly) return source
-        return source.filter { it.usageCost.startsWith("Est.", ignoreCase = true) }
+        if (!chargetripOnly) return source
+        return source.filter { it.usageCost.contains("(Chargetrip)", ignoreCase = true) }
     }
 
     private fun directionRow(cardinal: String): Row {

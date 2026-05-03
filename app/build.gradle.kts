@@ -21,13 +21,21 @@ android {
         applicationId = "com.skylarkin.evfinder"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.12"
+        versionCode = 15
+        versionName = "0.15"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        val ocmApiKey = (project.findProperty("OPEN_CHARGE_MAP_API_KEY") as String?) ?: ""
+        val ocmApiKey = (project.findProperty("OPEN_CHARGE_MAP_API_KEY") as String?)
+            ?: (project.findProperty("\uFEFFOPEN_CHARGE_MAP_API_KEY") as String?)
+            ?: (project.findProperty("ï»¿OPEN_CHARGE_MAP_API_KEY") as String?)
+            ?: (project.findProperty("OPEN_CHARGE_MAP_API") as String?)
+            ?: ""
+        val chargetripClientId = (project.findProperty("CHARGETRIP_CLIENT_ID") as String?) ?: ""
+        val chargetripAppId = (project.findProperty("CHARGETRIP_APP_ID") as String?) ?: ""
         buildConfigField("String", "OPEN_CHARGE_MAP_API_KEY", "\"$ocmApiKey\"")
+        buildConfigField("String", "CHARGETRIP_CLIENT_ID", "\"$chargetripClientId\"")
+        buildConfigField("String", "CHARGETRIP_APP_ID", "\"$chargetripAppId\"")
     }
 
     signingConfigs {

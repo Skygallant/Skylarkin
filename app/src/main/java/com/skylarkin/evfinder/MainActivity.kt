@@ -38,11 +38,14 @@ class MainActivity : AppCompatActivity() {
 
     private val adapter = ChargePointAdapter(::openInGoogleMaps)
     private val chargeMapClient by lazy {
-        val pricingCatalog = runCatching { IrishPricingCatalog.fromAssets(applicationContext) }.getOrNull()
         OpenChargeMapClient(
             apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY,
-            irishPricingCatalog = pricingCatalog,
-            fxRateProvider = FrankfurterFxRateProvider()
+            fxRateProvider = FrankfurterFxRateProvider(),
+            chargetripPricingClient = ChargetripPricingClient(
+                clientId = BuildConfig.CHARGETRIP_CLIENT_ID,
+                appId = BuildConfig.CHARGETRIP_APP_ID,
+                storageDir = filesDir
+            )
         )
     }
     private var currentResults: List<ChargePoint> = emptyList()

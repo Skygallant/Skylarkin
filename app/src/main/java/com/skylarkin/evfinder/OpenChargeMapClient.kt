@@ -17,8 +17,8 @@ import kotlin.math.pow
 
 class OpenChargeMapClient(
     private val apiKey: String,
-    private val irishPricingCatalog: IrishPricingCatalog? = null,
-    private val fxRateProvider: FxRateProvider = NoOpFxRateProvider
+    private val fxRateProvider: FxRateProvider = NoOpFxRateProvider,
+    private val chargetripPricingClient: ChargetripPricingClient? = null
 ) {
     private companion object {
         const val SEARCH_RADIUS_KM = 50.0
@@ -28,6 +28,7 @@ class OpenChargeMapClient(
         const val CLUSTER_REPRESENTATIVE_CHECKS = 2
         const val MAX_DIRECT_ROUTE_CHECKS = 30
         const val OSRM_ROUTE_ENDPOINT = "https://router.project-osrm.org/route/v1/driving"
+        const val ENABLE_OCM_PRICING_LOOKUP = false
     }
 
     private data class PricingInfo(
@@ -88,7 +89,7 @@ class OpenChargeMapClient(
         merged
     }
 
-    private fun parseAndFilter(
+    private suspend fun parseAndFilter(
         array: JSONArray,
         userLatitude: Double,
         userLongitude: Double,
@@ -104,7 +105,12 @@ class OpenChargeMapClient(
 
             if (!hasType2Connection(connections)) continue
 
-            val pricingInfo = extractPricingInfo(poi, addressInfo, connections, gbpToEurRate)
+            val pricingInfo = extractPricingInfo(
+                poi = poi,
+                addressInfo = addressInfo,
+                connections = connections,
+                gbpToEurRate = gbpToEurRate
+            )
             val parsedEuroCost = pricingInfo.euroPerKwh
             val isPublic = isPublic24x7(poi)
 
@@ -315,69 +321,74 @@ class OpenChargeMapClient(
         return String.format(Locale.US, "%.5f,%.5f", lat, lon)
     }
 
-    private fun extractPricingInfo(
+    private suspend fun extractPricingInfo(
         poi: JSONObject,
         addressInfo: JSONObject,
         connections: JSONArray,
         gbpToEurRate: Double?
     ): PricingInfo {
-        val primaryCandidates = mutableListOf<String>()
-        val fallbackCandidates = mutableListOf<String>()
+        if (ENABLE_OCM_PRICING_LOOKUP) {
+            val primaryCandidates = mutableListOf<String>()
+            val fallbackCandidates = mutableListOf<String>()
 
-        poi.optString("UsageCost", "").trim().takeIf { it.isNotBlank() }?.let { primaryCandidates.add(it) }
+            poi.optString("UsageCost", "").trim().takeIf { it.isNotBlank() }?.let { primaryCandidates.add(it) }
 
-        for (i in 0 until connections.length()) {
-            val connection = connections.optJSONObject(i) ?: continue
-            connection.optString("UsageCost", "").trim().takeIf { it.isNotBlank() }?.let { primaryCandidates.add(it) }
-            connection.optString("Comments", "").trim().takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
-        }
+            for (i in 0 until connections.length()) {
+                val connection = connections.optJSONObject(i) ?: continue
+                connection.optString("UsageCost", "").trim().takeIf { it.isNotBlank() }?.let { primaryCandidates.add(it) }
+                connection.optString("Comments", "").trim().takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
+            }
 
-        poi.optString("GeneralComments", "").trim().takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
-        poi.optJSONObject("UsageType")?.optString("Title", "")?.trim()?.takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
+            poi.optString("GeneralComments", "").trim().takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
+            poi.optJSONObject("UsageType")?.optString("Title", "")?.trim()?.takeIf { it.isNotBlank() }?.let { fallbackCandidates.add(it) }
 
-        val parsed = (primaryCandidates + fallbackCandidates)
-            .asSequence()
-            .mapNotNull { parseEuroCostPerKwh(it) }
-            .firstOrNull()
+            val parsed = (primaryCandidates + fallbackCandidates)
+                .asSequence()
+                .mapNotNull { parseEuroCostPerKwh(it) }
+                .firstOrNull()
 
-        if (parsed != null) {
-            return PricingInfo(
-                displayText = "EUR " + String.format(Locale.US, "%.2f", parsed) + "/kWh",
-                euroPerKwh = parsed
-            )
-        }
+            if (parsed != null) {
+                return PricingInfo(
+                    displayText = "EUR " + String.format(Locale.US, "%.2f", parsed) + "/kWh",
+                    euroPerKwh = parsed
+                )
+            }
 
-        val readableRaw = (primaryCandidates + fallbackCandidates)
-            .firstOrNull { looksLikePriceText(it) }
-            ?.let { compactPriceText(it) }
+            val readableRaw = (primaryCandidates + fallbackCandidates)
+                .firstOrNull { looksLikePriceText(it) }
+                ?.let { compactPriceText(it) }
 
-        if (readableRaw != null) {
-            return PricingInfo(readableRaw, null)
+            if (readableRaw != null) {
+                return PricingInfo(readableRaw, null)
+            }
         }
 
         val operatorName = poi.optJSONObject("OperatorInfo")?.optString("Title", "")?.trim()
         val siteTitle = addressInfo.optString("Title", "").trim()
-        val inferredPowerKw = inferMaxPowerKw(connections)
-        val inferredCurrentType = inferCurrentType(connections, inferredPowerKw)
+        val lat = addressInfo.optDouble("Latitude", Double.NaN)
+        val lon = addressInfo.optDouble("Longitude", Double.NaN)
 
-        val catalogMatch = irishPricingCatalog?.findBestMatch(
-            operatorName = operatorName,
-            siteTitle = siteTitle,
-            inferredPowerKw = inferredPowerKw,
-            inferredCurrentType = inferredCurrentType,
-            gbpToEurRate = gbpToEurRate
-        )
+        if (!lat.isNaN() && !lon.isNaN()) {
+            val chargetripMatch = runCatching {
+                chargetripPricingClient?.findBestMatch(
+                    operatorName = operatorName,
+                    siteTitle = siteTitle,
+                    latitude = lat,
+                    longitude = lon,
+                    gbpToEurRate = gbpToEurRate
+                )
+            }.getOrNull()
 
-        if (catalogMatch != null) {
-            val estimate = if (catalogMatch.originalCurrency.equals("GBP", ignoreCase = true)) {
-                val gbpPart = "Est. GBP " + String.format(Locale.US, "%.3f", catalogMatch.originalPricePerKwh) + "/kWh"
-                val eurPart = " (~EUR " + String.format(Locale.US, "%.2f", catalogMatch.euroPerKwh) + "/kWh)"
-                gbpPart + eurPart
-            } else {
-                "Est. EUR " + String.format(Locale.US, "%.2f", catalogMatch.euroPerKwh) + "/kWh"
+            if (chargetripMatch != null) {
+                val estimate = if (chargetripMatch.originalCurrency.equals("GBP", ignoreCase = true)) {
+                    val gbpPart = "CPO GBP " + String.format(Locale.US, "%.3f", chargetripMatch.originalPricePerKwh) + "/kWh"
+                    val eurPart = " (~EUR " + String.format(Locale.US, "%.2f", chargetripMatch.euroPerKwh) + "/kWh)"
+                    gbpPart + eurPart
+                } else {
+                    "CPO EUR " + String.format(Locale.US, "%.2f", chargetripMatch.euroPerKwh) + "/kWh"
+                }
+                return PricingInfo("$estimate (${chargetripMatch.sourceLabel})", chargetripMatch.euroPerKwh)
             }
-            val source = " (${catalogMatch.operator} ${catalogMatch.chargerType}, ${catalogMatch.confidence})"
-            return PricingInfo(estimate + source, catalogMatch.euroPerKwh)
         }
 
         return PricingInfo("Price unknown", null)
@@ -553,37 +564,6 @@ class OpenChargeMapClient(
             kotlin.math.sin(dLon / 2).pow(2.0) * kotlin.math.cos(lat1) * kotlin.math.cos(lat2)
         val c = 2 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
         return earthRadiusKm * c
-    }
-
-    private fun inferMaxPowerKw(connections: JSONArray): Double? {
-        var maxPower: Double? = null
-        for (i in 0 until connections.length()) {
-            val connection = connections.optJSONObject(i) ?: continue
-            val power = connection.optDouble("PowerKW", Double.NaN)
-            if (!power.isNaN()) {
-                maxPower = if (maxPower == null) power else maxOf(maxPower, power)
-            }
-        }
-        return maxPower
-    }
-
-    private fun inferCurrentType(connections: JSONArray, inferredPowerKw: Double?): String {
-        for (i in 0 until connections.length()) {
-            val connection = connections.optJSONObject(i) ?: continue
-            val currentTypeTitle = connection.optJSONObject("CurrentType")?.optString("Title", "")?.lowercase(Locale.US).orEmpty()
-            if (currentTypeTitle.contains("dc")) {
-                return if ((inferredPowerKw ?: 0.0) >= 150.0) "hpc" else "dc"
-            }
-            if (currentTypeTitle.contains("ac")) {
-                return "ac"
-            }
-        }
-
-        return when {
-            (inferredPowerKw ?: 0.0) >= 150.0 -> "hpc"
-            (inferredPowerKw ?: 0.0) > 22.0 -> "dc"
-            else -> "ac"
-        }
     }
 
     private fun normalizePriceText(text: String): String {
