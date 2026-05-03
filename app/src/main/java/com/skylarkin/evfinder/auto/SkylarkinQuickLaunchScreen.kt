@@ -15,9 +15,7 @@ import androidx.car.app.model.Template
 import androidx.car.app.model.Toggle
 import com.google.android.gms.location.LocationServices
 import com.skylarkin.evfinder.BuildConfig
-import com.skylarkin.evfinder.ChargetripPricingClient
 import com.skylarkin.evfinder.ChargePoint
-import com.skylarkin.evfinder.FrankfurterFxRateProvider
 import com.skylarkin.evfinder.OpenChargeMapClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,9 +32,9 @@ import java.util.Locale
 class SkylarkinQuickLaunchScreen(
     carContext: CarContext
 ) : Screen(carContext) {
-
     private companion object {
-        const val MAX_PRICE_EUR_PER_KWH = 0.50
+        const val USE_DETAILED_LOADING_MESSAGES = false
+        const val SIMPLE_LOADING_MESSAGE = "Searching nearby chargepoints..."
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -47,22 +45,13 @@ class SkylarkinQuickLaunchScreen(
     private var loadingStatusText: String = "Preparing search..."
     private var errorMessage: String? = null
     private var matches: List<ChargePoint> = emptyList()
-    private var chargetripOnly = false
     private var requireShowers = false
     private var lastKnownLocation: Location? = null
     private var pendingDirectionLaunch: String? = null
 
     init {
         chargeMapClient = OpenChargeMapClient(
-            apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY,
-            fxRateProvider = FrankfurterFxRateProvider(),
-            chargetripPricingClient = ChargetripPricingClient(
-                clientId = BuildConfig.CHARGETRIP_CLIENT_ID,
-                appId = BuildConfig.CHARGETRIP_APP_ID,
-                appIdentifier = BuildConfig.CHARGETRIP_APP_IDENTIFIER,
-                appFingerprint = BuildConfig.CHARGETRIP_APP_FINGERPRINT,
-                storageDir = carContext.filesDir
-            )
+            apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY
         )
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
@@ -127,21 +116,8 @@ class SkylarkinQuickLaunchScreen(
         listBuilder.addItem(directionRow("S"))
         listBuilder.addItem(directionRow("E"))
         listBuilder.addItem(directionRow("W"))
-        listBuilder.addItem(
-            Row.Builder()
-                .setTitle("Chargetrip pricing only")
-                .setToggle(
-                    Toggle.Builder { isChecked ->
-                        chargetripOnly = isChecked
-                        invalidate()
-                    }
-                        .setChecked(chargetripOnly)
-                        .build()
-                )
-                .build()
-        )
-        listBuilder.addItem(sleepRow())
         listBuilder.addItem(requireShowersRow())
+        listBuilder.addItem(sleepRow())
 
         return ListTemplate.Builder()
             .setHeader(
@@ -168,13 +144,11 @@ class SkylarkinQuickLaunchScreen(
                 chargeMapClient.findMatchingChargePoints(
                     latitude = location.latitude,
                     longitude = location.longitude,
-                    maxPriceEuroPerKwh = MAX_PRICE_EUR_PER_KWH,
                     onStage = { stage ->
-                        val status = when (stage) {
-                            OpenChargeMapClient.SearchStage.FETCHING_POI -> "Fetching nearby chargepoints..."
-                            OpenChargeMapClient.SearchStage.OPERATOR_PAGINATION -> "Loading operator pricing pages..."
-                            OpenChargeMapClient.SearchStage.APPLYING_FILTERS -> "Matching prices and applying filters..."
-                            OpenChargeMapClient.SearchStage.ISLAND_FILTERING -> "Checking island routing without ferries..."
+                        val status = if (USE_DETAILED_LOADING_MESSAGES) {
+                            detailedStageMessage(stage)
+                        } else {
+                            SIMPLE_LOADING_MESSAGE
                         }
                         carContext.mainExecutor.execute {
                             if (isLoading) {
@@ -184,9 +158,14 @@ class SkylarkinQuickLaunchScreen(
                         }
                     },
                     onFilterProgress = { detail ->
+                        val status = if (USE_DETAILED_LOADING_MESSAGES) {
+                            detail
+                        } else {
+                            SIMPLE_LOADING_MESSAGE
+                        }
                         carContext.mainExecutor.execute {
                             if (isLoading) {
-                                loadingStatusText = detail
+                                loadingStatusText = status
                                 invalidate()
                             }
                         }
@@ -243,8 +222,7 @@ class SkylarkinQuickLaunchScreen(
     }
 
     private fun filteredCandidates(source: List<ChargePoint>): List<ChargePoint> {
-        if (!chargetripOnly) return source
-        return source.filter { it.usageCost.contains("(Chargetrip)", ignoreCase = true) }
+        return source
     }
 
     private fun directionRow(cardinal: String): Row {
@@ -367,6 +345,15 @@ class SkylarkinQuickLaunchScreen(
             "E" -> code in setOf("E", "ENE", "ESE", "NE", "SE")
             "W" -> code in setOf("W", "WNW", "WSW", "NW", "SW")
             else -> false
+        }
+    }
+
+    private fun detailedStageMessage(stage: OpenChargeMapClient.SearchStage): String {
+        return when (stage) {
+            OpenChargeMapClient.SearchStage.FETCHING_POI -> "Fetching nearby chargepoints..."
+            OpenChargeMapClient.SearchStage.OPERATOR_PAGINATION -> "Preparing search..."
+            OpenChargeMapClient.SearchStage.APPLYING_FILTERS -> "Applying filters..."
+            OpenChargeMapClient.SearchStage.ISLAND_FILTERING -> "Checking island routing without ferries..."
         }
     }
 }

@@ -2,7 +2,6 @@
 <resources>
     <string name="app_name">Skylarkin</string>
     <string name="title">Nearby EV Chargepoints</string>
-    <string name="subtitle">Within 50 km, Type 2, public 24/7, adjust max price then press Search</string>
+    <string name="subtitle">Within 50 km, Type 2, public 24/7, then press Search</string>
     <string name="retry">Search</string>
-    <string name="ignore_unknown_prices">Hide unknown prices</string>
 </resources>

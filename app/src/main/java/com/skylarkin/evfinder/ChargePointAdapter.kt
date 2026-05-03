@@ -44,9 +44,8 @@ class ChargePointAdapter(
             addressText.text = item.address
             metaText.text = String.format(
                 Locale.US,
-                "%.1f km | %s | %s",
+                "%.1f km | %s",
                 item.distanceKm,
-                item.usageCost,
                 item.accessSummary
             )
 
