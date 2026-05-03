@@ -1,4 +1,4 @@
-﻿package com.skylarkin.evfinder
+package com.skylarkin.evfinder
 
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
@@ -12,6 +12,7 @@ import java.io.BufferedReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import kotlin.random.Random
 import kotlin.math.cos
 import kotlin.math.pow
 
@@ -20,15 +21,24 @@ class OpenChargeMapClient(
     private val fxRateProvider: FxRateProvider = NoOpFxRateProvider,
     private val chargetripPricingClient: ChargetripPricingClient? = null
 ) {
+    enum class SearchStage {
+        FETCHING_POI,
+        OPERATOR_PAGINATION,
+        APPLYING_FILTERS,
+        ISLAND_FILTERING
+    }
+
     private companion object {
         const val SEARCH_RADIUS_KM = 50.0
         const val BBOX_GRID_SIZE = 3
         const val BBOX_MAX_RESULTS = 300
-        const val CLUSTER_BUCKET_KM = 25.0
-        const val CLUSTER_REPRESENTATIVE_CHECKS = 2
-        const val MAX_DIRECT_ROUTE_CHECKS = 30
-        const val OSRM_ROUTE_ENDPOINT = "https://router.project-osrm.org/route/v1/driving"
+        const val ISLAND_SEPARATION_THRESHOLD_KM = 30.0
+        const val MAIN_CLUSTER_MAX_USER_DISTANCE_KM = 20.0
         const val ENABLE_OCM_PRICING_LOOKUP = false
+        const val OSRM_ROUTE_ENDPOINT = "https://router.project-osrm.org/route/v1/driving"
+        const val OSRM_CONNECT_TIMEOUT_MS = 3_000
+        const val OSRM_READ_TIMEOUT_MS = 3_000
+        val PUBLIC_USAGE_TYPE_IDS = hashSetOf(1, 4, 5, 6, 7)
     }
 
     private data class PricingInfo(
@@ -41,19 +51,45 @@ class OpenChargeMapClient(
         val west: Double,
         val east: Double
     )
-    private enum class RouteCheck {
-        NO_FERRY,
-        REQUIRES_FERRY,
-        NO_ROUTE,
-        UNKNOWN
-    }
 
-    suspend fun findMatchingChargePoints(latitude: Double, longitude: Double, maxPriceEuroPerKwh: Double): List<ChargePoint> {
+    suspend fun findMatchingChargePoints(
+        latitude: Double,
+        longitude: Double,
+        maxPriceEuroPerKwh: Double,
+        onStage: ((SearchStage) -> Unit)? = null,
+        onFilterProgress: ((String) -> Unit)? = null
+    ): List<ChargePoint> {
         return withContext(Dispatchers.Default) {
             val gbpToEurRate = runCatching { fxRateProvider.getRate("GBP", "EUR") }.getOrNull()
+            onStage?.invoke(SearchStage.FETCHING_POI)
             val json = fetchPoi(latitude, longitude)
-            val strictMatches = parseAndFilter(json, latitude, longitude, maxPriceEuroPerKwh, gbpToEurRate)
-            filterByClusteredRouteReachability(latitude, longitude, strictMatches)
+            val countryCodeHint = runCatching {
+                chargetripPricingClient?.resolveCountryCodeForLocation(latitude, longitude)
+            }.getOrNull()
+            onStage?.invoke(SearchStage.OPERATOR_PAGINATION)
+            runCatching {
+                chargetripPricingClient?.warmCountryCacheForLocation(
+                    latitude = latitude,
+                    longitude = longitude,
+                    countryCodeHint = countryCodeHint
+                )
+            }
+            onStage?.invoke(SearchStage.APPLYING_FILTERS)
+            val strictMatches = parseAndFilter(
+                array = json,
+                userLatitude = latitude,
+                userLongitude = longitude,
+                maxPriceEuroPerKwh = maxPriceEuroPerKwh,
+                gbpToEurRate = gbpToEurRate,
+                countryCodeHint = countryCodeHint,
+                onFilterProgress = onFilterProgress
+            )
+            onStage?.invoke(SearchStage.ISLAND_FILTERING)
+            filterByChargepointIslandConnectivity(
+                candidates = strictMatches,
+                userLatitude = latitude,
+                userLongitude = longitude
+            )
                 .sortedByDescending { it.distanceKm }
         }
     }
@@ -94,238 +130,321 @@ class OpenChargeMapClient(
         userLatitude: Double,
         userLongitude: Double,
         maxPriceEuroPerKwh: Double,
-        gbpToEurRate: Double?
+        gbpToEurRate: Double?,
+        countryCodeHint: String?,
+        onFilterProgress: ((String) -> Unit)?
     ): List<ChargePoint> {
-        val strictMatches = mutableListOf<ChargePoint>()
+        data class Candidate(
+            val poi: JSONObject,
+            val addressInfo: JSONObject,
+            val connections: JSONArray,
+            val lat: Double,
+            val lon: Double,
+            val distanceKm: Double
+        )
 
+        val strictMatches = mutableListOf<ChargePoint>()
+        val pricingMemo = HashMap<String, PricingInfo>()
+        val total = array.length().coerceAtLeast(1)
+        var invalidLocationRejected = 0
+        var distanceRejected = 0
+        var type2Rejected = 0
+        var accessRejected = 0
+        var priceRejected = 0
+
+        onFilterProgress?.invoke("Phase 1/4: checking 50km radius (0/$total)")
+
+        val distanceCandidates = mutableListOf<Candidate>()
         for (index in 0 until array.length()) {
             val poi = array.optJSONObject(index) ?: continue
             val addressInfo = poi.optJSONObject("AddressInfo") ?: continue
             val connections = poi.optJSONArray("Connections") ?: continue
 
-            if (!hasType2Connection(connections)) continue
-
-            val pricingInfo = extractPricingInfo(
-                poi = poi,
-                addressInfo = addressInfo,
-                connections = connections,
-                gbpToEurRate = gbpToEurRate
-            )
-            val parsedEuroCost = pricingInfo.euroPerKwh
-            val isPublic = isPublic24x7(poi)
-
-            if (parsedEuroCost == null || parsedEuroCost > maxPriceEuroPerKwh) continue
-            if (!isPublic) continue
-
-            val id = poi.optInt("ID")
-            val title = addressInfo.optString("Title").ifBlank { "Unnamed chargepoint" }
-            val address = buildAddressLine(addressInfo)
             val lat = addressInfo.optDouble("Latitude", Double.NaN)
             val lon = addressInfo.optDouble("Longitude", Double.NaN)
+            if (lat.isNaN() || lon.isNaN()) {
+                invalidLocationRejected += 1
+                continue
+            }
             val distance = haversineDistanceKm(userLatitude, userLongitude, lat, lon)
+            if (distance > SEARCH_RADIUS_KM) {
+                distanceRejected += 1
+                continue
+            }
+            distanceCandidates.add(
+                Candidate(
+                    poi = poi,
+                    addressInfo = addressInfo,
+                    connections = connections,
+                    lat = lat,
+                    lon = lon,
+                    distanceKm = distance
+                )
+            )
+            if ((index + 1) % 40 == 0 || index == array.length() - 1) {
+                onFilterProgress?.invoke("Phase 1/4: checking 50km radius (${index + 1}/$total)")
+            }
+        }
 
-            if (lat.isNaN() || lon.isNaN()) continue
-            if (distance > SEARCH_RADIUS_KM) continue
+        onFilterProgress?.invoke("Phase 2/4: filtering Type 2 connectors (remaining ${distanceCandidates.size}/$total)")
+        val type2Candidates = mutableListOf<Candidate>()
+        for (i in distanceCandidates.indices) {
+            val candidate = distanceCandidates[i]
+            if (!hasType2Connection(candidate.connections)) {
+                type2Rejected += 1
+                continue
+            }
+            type2Candidates.add(candidate)
+            if ((i + 1) % 40 == 0 || i == distanceCandidates.lastIndex) {
+                onFilterProgress?.invoke("Phase 2/4: filtering Type 2 connectors (${i + 1}/${distanceCandidates.size})")
+            }
+        }
 
+        onFilterProgress?.invoke("Phase 3/4: checking public 24/7 access (remaining ${type2Candidates.size}/$total)")
+        val publicCandidates = mutableListOf<Candidate>()
+        for (i in type2Candidates.indices) {
+            val candidate = type2Candidates[i]
+            val isPublic = isPublic24x7(candidate.poi)
+            if (!isPublic) {
+                accessRejected += 1
+                continue
+            }
+            publicCandidates.add(candidate)
+            if ((i + 1) % 40 == 0 || i == type2Candidates.lastIndex) {
+                onFilterProgress?.invoke("Phase 3/4: checking public 24/7 access (${i + 1}/${type2Candidates.size})")
+            }
+        }
+
+        onFilterProgress?.invoke("Phase 4/4: matching operator prices (remaining ${publicCandidates.size}/$total)")
+        for (i in publicCandidates.indices) {
+            val candidate = publicCandidates[i]
+            val pricingInfo = extractPricingInfo(
+                poi = candidate.poi,
+                addressInfo = candidate.addressInfo,
+                connections = candidate.connections,
+                gbpToEurRate = gbpToEurRate,
+                countryCodeHint = countryCodeHint,
+                pricingMemo = pricingMemo
+            )
+            val parsedEuroCost = pricingInfo.euroPerKwh
+            if (parsedEuroCost != null && parsedEuroCost > maxPriceEuroPerKwh) {
+                priceRejected += 1
+                if ((i + 1) % 40 == 0 || i == publicCandidates.lastIndex) {
+                    val remaining = (total - type2Rejected - accessRejected - priceRejected - distanceRejected - invalidLocationRejected)
+                        .coerceAtLeast(0)
+                    onFilterProgress?.invoke("Phase 4/4: applying price cap (remaining $remaining/$total)")
+                }
+                continue
+            }
+
+            val id = candidate.poi.optInt("ID")
+            val title = candidate.addressInfo.optString("Title").ifBlank { "Unnamed chargepoint" }
+            val address = buildAddressLine(candidate.addressInfo)
             val chargePoint = ChargePoint(
                 id = id,
                 name = title,
                 address = address,
-                latitude = lat,
-                longitude = lon,
-                distanceKm = distance,
+                latitude = candidate.lat,
+                longitude = candidate.lon,
+                distanceKm = candidate.distanceKm,
                 usageCost = pricingInfo.displayText,
-                accessSummary = if (isPublic) "Public (hours not always published)" else "Access type unknown",
+                accessSummary = "Public (hours not always published)",
                 directionCode = bearingToDirectionCode(
                     fromLat = userLatitude,
                     fromLon = userLongitude,
-                    toLat = lat,
-                    toLon = lon
+                    toLat = candidate.lat,
+                    toLon = candidate.lon
                 )
             )
 
-            if (isPublic && parsedEuroCost <= maxPriceEuroPerKwh) {
+            if (parsedEuroCost == null) {
+                strictMatches.add(chargePoint.copy(accessSummary = "Public 24/7"))
+            } else if (parsedEuroCost <= maxPriceEuroPerKwh) {
                 strictMatches.add(chargePoint.copy(accessSummary = "Public 24/7 - within price cap"))
             }
+
+            if ((i + 1) % 40 == 0 || i == publicCandidates.lastIndex) {
+                onFilterProgress?.invoke("Phase 4/4: matching operator prices (${i + 1}/${publicCandidates.size})")
+            }
         }
+
+        val remaining = (total - type2Rejected - accessRejected - priceRejected - distanceRejected - invalidLocationRejected)
+            .coerceAtLeast(0)
+        onFilterProgress?.invoke(
+            "Filter summary: kept ${strictMatches.size}, remaining $remaining/$total, rejected type2=$type2Rejected access=$accessRejected price=$priceRejected distance=$distanceRejected invalidLocation=$invalidLocationRejected"
+        )
 
         return strictMatches
     }
 
-    private suspend fun filterByClusteredRouteReachability(
+    private suspend fun filterByChargepointIslandConnectivity(
+        candidates: List<ChargePoint>,
         userLatitude: Double,
-        userLongitude: Double,
-        candidates: List<ChargePoint>
-    ): List<ChargePoint> = withContext(Dispatchers.IO) {
-        if (candidates.isEmpty()) return@withContext emptyList()
+        userLongitude: Double
+    ): List<ChargePoint> {
+        if (candidates.size <= 2) return candidates
 
-        val sortedByDistance = candidates.sortedBy { it.distanceKm }
-        val clusters = sortedByDistance.groupBy { (it.distanceKm / CLUSTER_BUCKET_KM).toInt() }.toSortedMap()
-        val allowedClusterIndexes = mutableSetOf<Int>()
+        val parent = IntArray(candidates.size) { it }
+        val rank = IntArray(candidates.size) { 0 }
 
-        for ((clusterIndex, points) in clusters) {
-            val representatives = points.sortedBy { it.distanceKm }.take(CLUSTER_REPRESENTATIVE_CHECKS)
-            var sawNoFerryRoute = false
-            var sawOnlyBlockedRoutes = true
-
-            for (point in representatives) {
-                when (checkRouteForFerry(userLatitude, userLongitude, point.latitude, point.longitude)) {
-                    RouteCheck.NO_FERRY -> {
-                        sawNoFerryRoute = true
-                        sawOnlyBlockedRoutes = false
-                        break
-                    }
-                    RouteCheck.REQUIRES_FERRY,
-                    RouteCheck.NO_ROUTE -> {
-                        // Keep probing additional representatives before rejecting this cluster.
-                    }
-                    RouteCheck.UNKNOWN -> {
-                        // Avoid over-filtering when routing API is unavailable/intermittent.
-                        sawOnlyBlockedRoutes = false
-                    }
-                }
+        fun find(x: Int): Int {
+            var n = x
+            while (parent[n] != n) {
+                parent[n] = parent[parent[n]]
+                n = parent[n]
             }
-
-            if (sawNoFerryRoute || !sawOnlyBlockedRoutes) {
-                allowedClusterIndexes.add(clusterIndex)
-            }
+            return n
         }
 
-        val clusterFiltered = sortedByDistance.filter { point ->
-            val bucket = (point.distanceKm / CLUSTER_BUCKET_KM).toInt()
-            bucket in allowedClusterIndexes
-        }
-
-        if (clusterFiltered.isEmpty()) {
-            return@withContext emptyList()
-        }
-
-        val checked = clusterFiltered.take(MAX_DIRECT_ROUTE_CHECKS)
-        val uncheckedTail = clusterFiltered.drop(MAX_DIRECT_ROUTE_CHECKS)
-        val keepIds = mutableSetOf<Int>()
-        val keepCoordinateKeys = mutableSetOf<String>()
-
-        for (point in checked) {
-            when (checkRouteForFerry(userLatitude, userLongitude, point.latitude, point.longitude)) {
-                RouteCheck.NO_FERRY,
-                RouteCheck.UNKNOWN -> {
-                    if (point.id > 0) keepIds.add(point.id)
-                    keepCoordinateKeys.add(coordinateKey(point.latitude, point.longitude))
-                }
-                RouteCheck.REQUIRES_FERRY,
-                RouteCheck.NO_ROUTE -> {
-                    // Exclude points that require ferry or have no drivable route.
+        fun union(a: Int, b: Int) {
+            val rootA = find(a)
+            val rootB = find(b)
+            if (rootA == rootB) return
+            when {
+                rank[rootA] < rank[rootB] -> parent[rootA] = rootB
+                rank[rootA] > rank[rootB] -> parent[rootB] = rootA
+                else -> {
+                    parent[rootB] = rootA
+                    rank[rootA]++
                 }
             }
         }
 
-        // Preserve tail without extra route checks to keep latency controlled.
-        for (point in uncheckedTail) {
-            if (point.id > 0) keepIds.add(point.id)
-            keepCoordinateKeys.add(coordinateKey(point.latitude, point.longitude))
+        for (i in candidates.indices) {
+            for (j in i + 1 until candidates.size) {
+                val d = haversineDistanceKm(
+                    candidates[i].latitude,
+                    candidates[i].longitude,
+                    candidates[j].latitude,
+                    candidates[j].longitude
+                )
+                if (d <= ISLAND_SEPARATION_THRESHOLD_KM) {
+                    union(i, j)
+                }
+            }
         }
 
-        clusterFiltered.filter { point ->
-            (point.id > 0 && point.id in keepIds) || coordinateKey(point.latitude, point.longitude) in keepCoordinateKeys
+        val components = mutableMapOf<Int, MutableList<Int>>()
+        for (i in candidates.indices) {
+            val root = find(i)
+            components.getOrPut(root) { mutableListOf() }.add(i)
         }
+
+        val mainRoot = components
+            .asSequence()
+            .filter { (_, members) ->
+                members.any { index ->
+                    haversineDistanceKm(
+                        userLatitude,
+                        userLongitude,
+                        candidates[index].latitude,
+                        candidates[index].longitude
+                    ) <= MAIN_CLUSTER_MAX_USER_DISTANCE_KM
+                }
+            }
+            .maxWithOrNull(
+                compareBy<Map.Entry<Int, MutableList<Int>>> { it.value.size }
+                    .thenByDescending { entry ->
+                        -entry.value.minOf { index ->
+                            haversineDistanceKm(
+                                userLatitude,
+                                userLongitude,
+                                candidates[index].latitude,
+                                candidates[index].longitude
+                            )
+                        }
+                    }
+            )
+            ?.key
+            ?: return candidates
+
+        val mainMembers = components[mainRoot].orEmpty()
+        if (mainMembers.isEmpty()) return candidates
+
+        val keepRoots = mutableSetOf(mainRoot)
+        for ((root, members) in components) {
+            if (root == mainRoot || members.isEmpty()) continue
+
+            val representativeIndex = members.randomOrNull(Random(root)) ?: continue
+            val representative = candidates[representativeIndex]
+            val closestMainIndex = mainMembers.minByOrNull { mainIndex ->
+                haversineDistanceKm(
+                    candidates[mainIndex].latitude,
+                    candidates[mainIndex].longitude,
+                    representative.latitude,
+                    representative.longitude
+                )
+            } ?: continue
+            val mainPoint = candidates[closestMainIndex]
+
+            val reachableWithoutFerry = canRouteWithoutFerry(
+                fromLat = mainPoint.latitude,
+                fromLon = mainPoint.longitude,
+                toLat = representative.latitude,
+                toLon = representative.longitude
+            )
+            if (reachableWithoutFerry) {
+                keepRoots.add(root)
+            }
+        }
+
+        return candidates.filterIndexed { index, _ -> keepRoots.contains(find(index)) }
     }
 
-    private fun checkRouteForFerry(
+    private suspend fun canRouteWithoutFerry(
         fromLat: Double,
         fromLon: Double,
         toLat: Double,
         toLon: Double
-    ): RouteCheck {
-        val coordinates = buildString {
-            append(formatCoordinate(fromLon))
-            append(",")
-            append(formatCoordinate(fromLat))
-            append(";")
-            append(formatCoordinate(toLon))
-            append(",")
-            append(formatCoordinate(toLat))
-        }
-
+    ): Boolean = withContext(Dispatchers.IO) {
+        val coordinates = "${formatCoordinate(fromLon)},${formatCoordinate(fromLat)};${formatCoordinate(toLon)},${formatCoordinate(toLat)}"
         val url = Uri.parse("$OSRM_ROUTE_ENDPOINT/$coordinates")
             .buildUpon()
             .appendQueryParameter("overview", "false")
-            .appendQueryParameter("steps", "true")
             .appendQueryParameter("alternatives", "false")
+            .appendQueryParameter("steps", "false")
+            .appendQueryParameter("exclude", "ferry")
             .build()
             .toString()
 
         val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             setRequestProperty("Accept", "application/json")
-            connectTimeout = 6_000
-            readTimeout = 6_000
+            connectTimeout = OSRM_CONNECT_TIMEOUT_MS
+            readTimeout = OSRM_READ_TIMEOUT_MS
         }
 
-        return try {
+        return@withContext try {
             val stream = if (connection.responseCode in 200..299) {
                 connection.inputStream
             } else {
                 connection.errorStream
             }
             val response = stream.bufferedReader().use(BufferedReader::readText)
-
-            if (connection.responseCode !in 200..299) {
-                return RouteCheck.UNKNOWN
-            }
-
             val json = JSONObject(response)
             val code = json.optString("code", "")
             if (code.equals("NoRoute", ignoreCase = true)) {
-                return RouteCheck.NO_ROUTE
+                false
+            } else if (code.equals("Ok", ignoreCase = true)) {
+                val routes = json.optJSONArray("routes")
+                routes != null && routes.length() > 0
+            } else {
+                true
             }
-            if (!code.equals("Ok", ignoreCase = true)) {
-                return RouteCheck.UNKNOWN
-            }
-
-            val routes = json.optJSONArray("routes")
-            if (routes == null || routes.length() == 0) {
-                return RouteCheck.NO_ROUTE
-            }
-
-            val route = routes.optJSONObject(0) ?: return RouteCheck.NO_ROUTE
-            val legs = route.optJSONArray("legs") ?: return RouteCheck.NO_ROUTE
-            var requiresFerry = false
-
-            for (legIndex in 0 until legs.length()) {
-                val leg = legs.optJSONObject(legIndex) ?: continue
-                val steps = leg.optJSONArray("steps") ?: continue
-                for (stepIndex in 0 until steps.length()) {
-                    val step = steps.optJSONObject(stepIndex) ?: continue
-                    val mode = step.optString("mode", "").lowercase(Locale.US)
-                    val maneuverType = step.optJSONObject("maneuver")
-                        ?.optString("type", "")
-                        ?.lowercase(Locale.US)
-                        .orEmpty()
-                    if (mode == "ferry" || maneuverType == "ferry") {
-                        requiresFerry = true
-                        break
-                    }
-                }
-                if (requiresFerry) break
-            }
-
-            if (requiresFerry) RouteCheck.REQUIRES_FERRY else RouteCheck.NO_FERRY
         } catch (_: Exception) {
-            RouteCheck.UNKNOWN
+            true
         } finally {
             connection.disconnect()
         }
-    }
-
-    private fun coordinateKey(lat: Double, lon: Double): String {
-        return String.format(Locale.US, "%.5f,%.5f", lat, lon)
     }
 
     private suspend fun extractPricingInfo(
         poi: JSONObject,
         addressInfo: JSONObject,
         connections: JSONArray,
-        gbpToEurRate: Double?
+        gbpToEurRate: Double?,
+        countryCodeHint: String?,
+        pricingMemo: MutableMap<String, PricingInfo>
     ): PricingInfo {
         if (ENABLE_OCM_PRICING_LOOKUP) {
             val primaryCandidates = mutableListOf<String>()
@@ -364,17 +483,22 @@ class OpenChargeMapClient(
         }
 
         val operatorName = poi.optJSONObject("OperatorInfo")?.optString("Title", "")?.trim()
-        val siteTitle = addressInfo.optString("Title", "").trim()
+        val stationName = addressInfo.optString("Title", "").trim()
+        val stationId = poi.optInt("ID", -1).takeIf { it > 0 }?.toString()
+        val memoKey = (operatorName.orEmpty().lowercase(Locale.US) + "|" + stationId.orEmpty())
+        pricingMemo[memoKey]?.let { return it }
         val lat = addressInfo.optDouble("Latitude", Double.NaN)
         val lon = addressInfo.optDouble("Longitude", Double.NaN)
 
-        if (!lat.isNaN() && !lon.isNaN()) {
+        if (!lat.isNaN() && !lon.isNaN() && !operatorName.isNullOrBlank()) {
             val chargetripMatch = runCatching {
                 chargetripPricingClient?.findBestMatch(
                     operatorName = operatorName,
-                    siteTitle = siteTitle,
+                    stationName = stationName,
+                    stationExternalId = stationId,
                     latitude = lat,
                     longitude = lon,
+                    countryCodeHint = countryCodeHint,
                     gbpToEurRate = gbpToEurRate
                 )
             }.getOrNull()
@@ -387,11 +511,15 @@ class OpenChargeMapClient(
                 } else {
                     "CPO EUR " + String.format(Locale.US, "%.2f", chargetripMatch.euroPerKwh) + "/kWh"
                 }
-                return PricingInfo("$estimate (${chargetripMatch.sourceLabel})", chargetripMatch.euroPerKwh)
+                val info = PricingInfo("$estimate (${chargetripMatch.sourceLabel})", chargetripMatch.euroPerKwh)
+                pricingMemo[memoKey] = info
+                return info
             }
         }
 
-        return PricingInfo("Price unknown", null)
+        val unknown = PricingInfo("Price unknown", null)
+        pricingMemo[memoKey] = unknown
+        return unknown
     }
 
     private fun hasType2Connection(connections: JSONArray): Boolean {
@@ -575,26 +703,25 @@ class OpenChargeMapClient(
 
     private fun isPublic24x7(poi: JSONObject): Boolean {
         val usageType = poi.optJSONObject("UsageType")
-        val usageTitle = usageType?.optString("Title", "") ?: ""
+        val usageTitle = usageType?.optString("Title", "").orEmpty()
         val usageTypeId = poi.optInt("UsageTypeID", 0)
-        val usageText = usageTitle.lowercase()
+        val usageText = usageTitle.lowercase(Locale.US)
 
-        val likelyPublic = usageText.contains("public") || usageTypeId in setOf(1, 4, 5, 6, 7)
+        val likelyPublic = usageText.contains("public") || PUBLIC_USAGE_TYPE_IDS.contains(usageTypeId)
         if (!likelyPublic) return false
 
-        val isMembershipRequired = usageType?.optBoolean("IsMembershipRequired", false) ?: false
-        val isAccessKeyRequired = usageType?.optBoolean("IsAccessKeyRequired", false) ?: false
+        val isMembershipRequired = usageType?.optBoolean("IsMembershipRequired", false) == true
+        val isAccessKeyRequired = usageType?.optBoolean("IsAccessKeyRequired", false) == true
         if (isMembershipRequired || isAccessKeyRequired) return false
 
         val statusType = poi.optJSONObject("StatusType")
-        val statusTitle = statusType?.optString("Title", "") ?: ""
+        val statusTitle = statusType?.optString("Title", "").orEmpty()
         if (statusTitle.contains("planned", ignoreCase = true)) return false
 
-        val comments = listOf(
-            poi.optString("GeneralComments", ""),
-            usageTitle
-        ).joinToString(" ").lowercase()
+        val generalComments = poi.optString("GeneralComments", "")
+        if (generalComments.isBlank()) return true
 
+        val comments = generalComments.lowercase(Locale.US)
         val likelyAlwaysOpen = comments.contains("24/7") ||
             comments.contains("24h") ||
             comments.contains("24 hours") ||

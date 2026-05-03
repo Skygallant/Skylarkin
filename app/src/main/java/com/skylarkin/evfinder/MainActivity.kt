@@ -35,28 +35,36 @@ class MainActivity : AppCompatActivity() {
     private lateinit var priceSlider: Slider
     private lateinit var priceValueText: TextView
     private lateinit var sortToggle: CompoundButton
+    private lateinit var ignoreUnknownPriceToggle: CompoundButton
 
     private val adapter = ChargePointAdapter(::openInGoogleMaps)
+    private val chargetripPricingClient by lazy {
+        ChargetripPricingClient(
+            clientId = BuildConfig.CHARGETRIP_CLIENT_ID,
+            appId = BuildConfig.CHARGETRIP_APP_ID,
+            appIdentifier = BuildConfig.CHARGETRIP_APP_IDENTIFIER,
+            appFingerprint = BuildConfig.CHARGETRIP_APP_FINGERPRINT,
+            storageDir = filesDir
+        )
+    }
     private val chargeMapClient by lazy {
         OpenChargeMapClient(
             apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY,
             fxRateProvider = FrankfurterFxRateProvider(),
-            chargetripPricingClient = ChargetripPricingClient(
-                clientId = BuildConfig.CHARGETRIP_CLIENT_ID,
-                appId = BuildConfig.CHARGETRIP_APP_ID,
-                storageDir = filesDir
-            )
+            chargetripPricingClient = chargetripPricingClient
         )
     }
     private var currentResults: List<ChargePoint> = emptyList()
     private var searchJob: Job? = null
+    private var startupCacheWarmJob: Job? = null
     private var queryToken: Long = 0L
+    private var didStartupCountryCheck = false
 
     private val locationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            loadChargePoints()
+            ensureLocationAndLoad(startup = true)
         } else {
             showStatus(
                 "Location permission is needed to search nearby chargers within 50 km.",
@@ -77,6 +85,7 @@ class MainActivity : AppCompatActivity() {
         priceSlider = findViewById(R.id.priceSlider)
         priceValueText = findViewById(R.id.priceValueText)
         sortToggle = findViewById(R.id.sortToggle)
+        ignoreUnknownPriceToggle = findViewById(R.id.ignoreUnknownPriceToggle)
 
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
@@ -90,17 +99,58 @@ class MainActivity : AppCompatActivity() {
             sortToggle.text = if (isChecked) "Farthest first" else "Closest first"
             renderCurrentResults()
         }
+        ignoreUnknownPriceToggle.setOnCheckedChangeListener { _, _ ->
+            renderCurrentResults()
+        }
 
         retryButton.setOnClickListener { ensureLocationAndLoad() }
 
-        ensureLocationAndLoad()
+        ensureLocationAndLoad(startup = true)
     }
 
-    private fun ensureLocationAndLoad() {
+    private fun ensureLocationAndLoad(startup: Boolean = false) {
         if (hasLocationPermission()) {
+            if (startup && !didStartupCountryCheck) {
+                didStartupCountryCheck = true
+                warmCountryOperatorCacheOnStartup()
+            }
             loadChargePoints()
         } else {
             locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+
+    private fun warmCountryOperatorCacheOnStartup() {
+        startupCacheWarmJob?.cancel()
+        val fusedClient = LocationServices.getFusedLocationProviderClient(this)
+        try {
+            fusedClient.lastLocation
+                .addOnSuccessListener(this) { location ->
+                    if (location == null) {
+                        return@addOnSuccessListener
+                    }
+                    startupCacheWarmJob = lifecycleScope.launch(Dispatchers.Default) {
+                        val countryCode = runCatching {
+                            chargetripPricingClient.resolveCountryCodeViaNominatimOnDemand(
+                                latitude = location.latitude,
+                                longitude = location.longitude
+                            )
+                        }.getOrDefault("")
+
+                        if (countryCode.isNotBlank()) {
+                            runCatching {
+                                chargetripPricingClient.warmCountryCacheForLocation(
+                                    latitude = location.latitude,
+                                    longitude = location.longitude,
+                                    countryCodeHint = countryCode
+                                )
+                            }
+                        }
+                    }
+                }
+                .addOnFailureListener(this) { }
+        } catch (_: SecurityException) {
+            // ignore warm cache failure
         }
     }
 
@@ -110,7 +160,7 @@ class MainActivity : AppCompatActivity() {
 
         val maxPriceEuro = selectedMaxPriceEuro()
         val maxPriceCent = (maxPriceEuro * 100.0).toInt()
-        showStatus("Loading chargepoints up to ${maxPriceCent}c/kWh...", showRetry = false, loading = true)
+        showStatus("Getting your current location...", showRetry = false, loading = true)
 
         val fusedClient = LocationServices.getFusedLocationProviderClient(this)
         try {
@@ -131,9 +181,33 @@ class MainActivity : AppCompatActivity() {
                     searchJob = lifecycleScope.launch(Dispatchers.Default) {
                         val result = runCatching {
                             chargeMapClient.findMatchingChargePoints(
-                                location.latitude,
-                                location.longitude,
-                                maxPriceEuro
+                                latitude = location.latitude,
+                                longitude = location.longitude,
+                                maxPriceEuroPerKwh = maxPriceEuro,
+                                onStage = { stage ->
+                                    val message = when (stage) {
+                                        OpenChargeMapClient.SearchStage.FETCHING_POI ->
+                                            "Fetching nearby chargepoints..."
+                                        OpenChargeMapClient.SearchStage.OPERATOR_PAGINATION ->
+                                            "Loading operator pricing pages..."
+                                        OpenChargeMapClient.SearchStage.APPLYING_FILTERS ->
+                                            "Matching prices and applying filters..."
+                                        OpenChargeMapClient.SearchStage.ISLAND_FILTERING ->
+                                            "Removing isolated chargepoint islands..."
+                                    }
+                                    runOnUiThread {
+                                        if (activeToken == queryToken) {
+                                            showStatus(message, showRetry = false, loading = true)
+                                        }
+                                    }
+                                },
+                                onFilterProgress = { detail ->
+                                    runOnUiThread {
+                                        if (activeToken == queryToken) {
+                                            showStatus(detail, showRetry = false, loading = true)
+                                        }
+                                    }
+                                }
                             )
                         }
 
@@ -187,6 +261,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         searchJob?.cancel()
+        startupCacheWarmJob?.cancel()
         recyclerView.adapter = null
         super.onDestroy()
     }
@@ -221,10 +296,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderCurrentResults() {
-        val sorted = if (sortToggle.isChecked) {
-            currentResults.sortedByDescending { it.distanceKm }
+        val filtered = if (ignoreUnknownPriceToggle.isChecked) {
+            currentResults.filter { !it.usageCost.contains("price unknown", ignoreCase = true) }
         } else {
-            currentResults.sortedBy { it.distanceKm }
+            currentResults
+        }
+
+        val sorted = if (sortToggle.isChecked) {
+            filtered.sortedByDescending { it.distanceKm }
+        } else {
+            filtered.sortedBy { it.distanceKm }
         }
         adapter.submitList(sorted)
     }

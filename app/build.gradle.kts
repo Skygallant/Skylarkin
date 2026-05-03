@@ -21,8 +21,8 @@ android {
         applicationId = "com.skylarkin.evfinder"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "0.15"
+        versionCode = 18
+        versionName = "0.18"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -33,9 +33,16 @@ android {
             ?: ""
         val chargetripClientId = (project.findProperty("CHARGETRIP_CLIENT_ID") as String?) ?: ""
         val chargetripAppId = (project.findProperty("CHARGETRIP_APP_ID") as String?) ?: ""
+        val chargetripAppIdentifier = (project.findProperty("CHARGETRIP_APP_IDENTIFIER") as String?)
+            ?: applicationId
+        val chargetripAppFingerprint = (project.findProperty("CHARGETRIP_APP_FINGERPRINT") as String?)
+            ?: (project.findProperty("CHARGETRIP_ANDROID_SHA256") as String?)
+            ?: ""
         buildConfigField("String", "OPEN_CHARGE_MAP_API_KEY", "\"$ocmApiKey\"")
         buildConfigField("String", "CHARGETRIP_CLIENT_ID", "\"$chargetripClientId\"")
         buildConfigField("String", "CHARGETRIP_APP_ID", "\"$chargetripAppId\"")
+        buildConfigField("String", "CHARGETRIP_APP_IDENTIFIER", "\"$chargetripAppIdentifier\"")
+        buildConfigField("String", "CHARGETRIP_APP_FINGERPRINT", "\"$chargetripAppFingerprint\"")
     }
 
     signingConfigs {

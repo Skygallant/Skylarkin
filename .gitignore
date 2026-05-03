@@ -24,3 +24,6 @@ key.properties
 *.keystore
 
 play-service-account.json
+
+scripts
+

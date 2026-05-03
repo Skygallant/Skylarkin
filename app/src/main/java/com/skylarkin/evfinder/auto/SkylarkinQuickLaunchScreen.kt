@@ -44,6 +44,7 @@ class SkylarkinQuickLaunchScreen(
     private val sleepSpotClient = OsmSleepSpotClient()
 
     private var isLoading = false
+    private var loadingStatusText: String = "Preparing search..."
     private var errorMessage: String? = null
     private var matches: List<ChargePoint> = emptyList()
     private var chargetripOnly = false
@@ -58,6 +59,8 @@ class SkylarkinQuickLaunchScreen(
             chargetripPricingClient = ChargetripPricingClient(
                 clientId = BuildConfig.CHARGETRIP_CLIENT_ID,
                 appId = BuildConfig.CHARGETRIP_APP_ID,
+                appIdentifier = BuildConfig.CHARGETRIP_APP_IDENTIFIER,
+                appFingerprint = BuildConfig.CHARGETRIP_APP_FINGERPRINT,
                 storageDir = carContext.filesDir
             )
         )
@@ -70,11 +73,20 @@ class SkylarkinQuickLaunchScreen(
 
     override fun onGetTemplate(): Template {
         if (isLoading) {
+            val loadingRow = Row.Builder()
+                .setTitle("Loading")
+                .addText(loadingStatusText)
+                .build()
             return ListTemplate.Builder()
                 .setHeader(
                     Header.Builder()
                         .setTitle("Skylarkin Quick Launch")
                         .setStartHeaderAction(Action.APP_ICON)
+                        .build()
+                )
+                .setSingleList(
+                    ItemList.Builder()
+                        .addItem(loadingRow)
                         .build()
                 )
                 .setLoading(true)
@@ -144,6 +156,7 @@ class SkylarkinQuickLaunchScreen(
 
     private fun reloadMatches() {
         isLoading = true
+        loadingStatusText = "Getting current location..."
         errorMessage = null
         invalidate()
 
@@ -155,11 +168,34 @@ class SkylarkinQuickLaunchScreen(
                 chargeMapClient.findMatchingChargePoints(
                     latitude = location.latitude,
                     longitude = location.longitude,
-                    maxPriceEuroPerKwh = MAX_PRICE_EUR_PER_KWH
+                    maxPriceEuroPerKwh = MAX_PRICE_EUR_PER_KWH,
+                    onStage = { stage ->
+                        val status = when (stage) {
+                            OpenChargeMapClient.SearchStage.FETCHING_POI -> "Fetching nearby chargepoints..."
+                            OpenChargeMapClient.SearchStage.OPERATOR_PAGINATION -> "Loading operator pricing pages..."
+                            OpenChargeMapClient.SearchStage.APPLYING_FILTERS -> "Matching prices and applying filters..."
+                            OpenChargeMapClient.SearchStage.ISLAND_FILTERING -> "Checking island routing without ferries..."
+                        }
+                        carContext.mainExecutor.execute {
+                            if (isLoading) {
+                                loadingStatusText = status
+                                invalidate()
+                            }
+                        }
+                    },
+                    onFilterProgress = { detail ->
+                        carContext.mainExecutor.execute {
+                            if (isLoading) {
+                                loadingStatusText = detail
+                                invalidate()
+                            }
+                        }
+                    }
                 )
             }.onSuccess { loaded ->
                 carContext.mainExecutor.execute {
                     isLoading = false
+                    loadingStatusText = "Preparing search..."
                     errorMessage = null
                     matches = loaded
                     val pending = pendingDirectionLaunch
@@ -172,6 +208,7 @@ class SkylarkinQuickLaunchScreen(
             }.onFailure { error ->
                 carContext.mainExecutor.execute {
                     isLoading = false
+                    loadingStatusText = "Preparing search..."
                     errorMessage = error.message ?: "Unknown error"
                     matches = emptyList()
                     invalidate()

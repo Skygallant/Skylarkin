@@ -1,4 +1,4 @@
-﻿package com.skylarkin.evfinder
+package com.skylarkin.evfinder
 
 import android.content.Context
 import java.io.BufferedReader

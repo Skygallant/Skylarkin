@@ -1,27 +1,32 @@
 package com.skylarkin.evfinder
 
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
-import kotlin.math.pow
+import java.util.concurrent.ConcurrentHashMap
 
 class ChargetripPricingClient(
     private val clientId: String,
     private val appId: String,
+    private val appIdentifier: String,
+    private val appFingerprint: String,
     private val storageDir: File?
 ) {
     private companion object {
-        const val ENDPOINT = "https://api.chargetrip.io/graphql"
-        const val CONNECT_TIMEOUT_MS = 10_000
-        const val READ_TIMEOUT_MS = 10_000
-        const val CACHE_FILE_PREFIX = "chargetrip_operator_prices_cache_v1"
+        const val CHARGETRIP_ENDPOINT = "https://api.chargetrip.io/graphql"
+        const val CONNECT_TIMEOUT_MS = 7_000
+        const val READ_TIMEOUT_MS = 7_000
         const val CACHE_TTL_MS = 28L * 24L * 60L * 60L * 1000L
-        const val COUNTRY_RESOLVE_DISTANCE_METERS = 10_000
-        const val STATION_PAGE_SIZE = 200
-        const val OPERATOR_PAGE_SIZE = 1000
-        const val OPERATOR_MAX_PAGES = 20
+        const val COUNTRY_LOOKUP_CACHE_TTL_MS = 6L * 60L * 60L * 1000L
+        const val NOMINATIM_REVERSE_ENDPOINT = "https://nominatim.openstreetmap.org/reverse"
+        const val OPERATOR_PAGE_SIZE = 300
+        const val STATION_PAGE_SIZE = 20
+        const val REQUIRED_SAMPLES_PER_OPERATOR = 10
+        const val OPERATOR_LIST_CACHE_PREFIX = "chargetrip_operator_list_cache_v1"
+        const val OPERATOR_PRICE_BUILD_CACHE_PREFIX = "chargetrip_operator_price_build_cache_v1"
     }
 
     data class Match(
@@ -31,218 +36,246 @@ class ChargetripPricingClient(
         val sourceLabel: String
     )
 
-    private data class OperatorPrice(
-        val operatorName: String,
+    private data class CountryLookupEntry(
+        val countryCode: String,
+        val updatedAtEpochMs: Long
+    )
+
+    private data class OperatorRef(
+        val id: String?,
+        val name: String,
+        val normalizedName: String
+    )
+
+    private data class CountryOperatorListCache(
+        val countryCode: String,
+        val updatedAtEpochMs: Long,
+        val operatorsByNormalizedName: Map<String, OperatorRef>,
+        val uniqueKeywordToOperatorNormalizedName: Map<String, String>
+    )
+
+    private data class OperatorPriceSample(
+        val stationKey: String,
         val euroPerKwh: Double,
         val originalPricePerKwh: Double,
         val originalCurrency: String,
-        val sampleCount: Int
+        val capturedAtEpochMs: Long
     )
 
-    private data class CountryCache(
-        val countryCode: String,
-        val updatedAtEpochMs: Long,
-        val pricesByNormalizedOperator: Map<String, OperatorPrice>
+    private data class OperatorPriceEntry(
+        val operatorId: String?,
+        val operatorName: String,
+        val normalizedOperatorName: String,
+        val samples: MutableList<OperatorPriceSample>,
+        var updatedAtEpochMs: Long
     )
+
+    private data class CountryOperatorPriceBuildCache(
+        val countryCode: String,
+        var updatedAtEpochMs: Long,
+        val entriesByNormalizedName: MutableMap<String, OperatorPriceEntry>
+    )
+
+    private val countryLookupCache = ConcurrentHashMap<String, CountryLookupEntry>()
 
     @Volatile
-    private var inMemoryCache: CountryCache? = null
+    private var inMemoryOperatorListCache: CountryOperatorListCache? = null
+
+    @Volatile
+    private var inMemoryBuildCache: CountryOperatorPriceBuildCache? = null
+
+    suspend fun resolveCountryCodeForLocation(latitude: Double, longitude: Double): String {
+        val key = countryLookupKey(latitude, longitude)
+        val now = System.currentTimeMillis()
+        countryLookupCache[key]?.let { cached ->
+            if (now - cached.updatedAtEpochMs <= COUNTRY_LOOKUP_CACHE_TTL_MS && isCountryCode(cached.countryCode)) {
+                return cached.countryCode
+            }
+        }
+
+        val nominatim = resolveCountryCodeViaNominatim(latitude, longitude)
+        if (isCountryCode(nominatim)) {
+            val normalized = nominatim.uppercase(Locale.US)
+            countryLookupCache[key] = CountryLookupEntry(normalized, now)
+            return normalized
+        }
+
+        return Locale.getDefault().country.uppercase(Locale.US)
+    }
+
+    suspend fun resolveCountryCodeViaNominatimOnDemand(latitude: Double, longitude: Double): String {
+        val code = resolveCountryCodeViaNominatim(latitude, longitude)
+        if (isCountryCode(code)) {
+            val normalized = code.uppercase(Locale.US)
+            countryLookupCache[countryLookupKey(latitude, longitude)] = CountryLookupEntry(normalized, System.currentTimeMillis())
+            return normalized
+        }
+        return ""
+    }
+
+    suspend fun warmCountryCacheForLocation(
+        latitude: Double,
+        longitude: Double,
+        countryCodeHint: String?
+    ) {
+        if (clientId.isBlank() || appId.isBlank()) return
+        val countryCode = resolveCountryCodeWithHint(countryCodeHint, latitude, longitude)
+        if (countryCode.isBlank()) return
+        ensureCountryOperatorListCache(countryCode)
+        loadBuildCache(countryCode)
+    }
 
     suspend fun findBestMatch(
         operatorName: String?,
-        siteTitle: String?,
+        stationName: String?,
+        stationExternalId: String?,
         latitude: Double,
         longitude: Double,
+        countryCodeHint: String? = null,
         gbpToEurRate: Double?
     ): Match? {
         if (clientId.isBlank() || appId.isBlank()) return null
 
-        val countryCode = resolveCountryCode(latitude, longitude).ifBlank {
-            Locale.getDefault().country.uppercase(Locale.US)
-        }
+        val normalizedOperator = normalize(operatorName)
+        if (normalizedOperator.isBlank()) return null
+
+        val countryCode = resolveCountryCodeWithHint(countryCodeHint, latitude, longitude)
         if (countryCode.isBlank()) return null
 
-        val cache = ensureCountryCache(countryCode, gbpToEurRate)
-        if (cache.pricesByNormalizedOperator.isEmpty()) return null
-
-        val normalizedOperator = normalize(operatorName)
-        val normalizedSite = normalize(siteTitle)
-        val best = pickBestOperatorPrice(
-            pricesByOperator = cache.pricesByNormalizedOperator,
-            normalizedOperator = normalizedOperator,
-            normalizedSite = normalizedSite
+        val operatorList = ensureCountryOperatorListCache(countryCode)
+        val operatorRef = resolveOperatorRefFromOcmOperator(
+            normalizedOcmOperatorName = normalizedOperator,
+            operatorListCache = operatorList
         ) ?: return null
 
-        return Match(
-            euroPerKwh = best.euroPerKwh,
-            originalPricePerKwh = best.originalPricePerKwh,
-            originalCurrency = best.originalCurrency,
-            sourceLabel = "Chargetrip cache ${cache.countryCode}"
-        )
-    }
-
-    private fun ensureCountryCache(
-        countryCode: String,
-        gbpToEurRate: Double?
-    ): CountryCache {
+        val buildCache = loadBuildCache(countryCode)
         val now = System.currentTimeMillis()
+        if (!isFresh(buildCache.updatedAtEpochMs, now)) {
+            buildCache.entriesByNormalizedName.clear()
+            buildCache.updatedAtEpochMs = now
+        }
 
-        inMemoryCache?.let { memory ->
-            if (memory.countryCode == countryCode && isFresh(memory.updatedAtEpochMs, now)) {
-                return memory
+        val entry = buildCache.entriesByNormalizedName.getOrPut(operatorRef.normalizedName) {
+            OperatorPriceEntry(
+                operatorId = operatorRef.id,
+                operatorName = operatorRef.name,
+                normalizedOperatorName = operatorRef.normalizedName,
+                samples = mutableListOf(),
+                updatedAtEpochMs = now
+            )
+        }
+
+        if (!isFresh(entry.updatedAtEpochMs, now)) {
+            entry.samples.clear()
+            entry.updatedAtEpochMs = now
+        }
+
+        if (entry.samples.size < REQUIRED_SAMPLES_PER_OPERATOR) {
+            val stationKey = buildStationKey(stationExternalId, stationName)
+            val alreadySampled = entry.samples.any { it.stationKey == stationKey }
+            if (!alreadySampled) {
+                val searchQuery = stationName?.trim().takeUnless { it.isNullOrBlank() } ?: operatorRef.name
+                val sample = fetchSingleStationSample(
+                    operatorRef = operatorRef,
+                    searchQuery = searchQuery,
+                    gbpToEurRate = gbpToEurRate,
+                    stationKey = stationKey,
+                    now = now
+                )
+                if (sample != null) {
+                    entry.samples.add(sample)
+                    entry.updatedAtEpochMs = now
+                    buildCache.updatedAtEpochMs = now
+                    writeBuildCacheToDisk(buildCache)
+                }
             }
         }
 
-        val diskCache = readCacheFromDisk(countryCode)
-        if (diskCache != null && isFresh(diskCache.updatedAtEpochMs, now)) {
-            inMemoryCache = diskCache
-            return diskCache
+        if (entry.samples.size < REQUIRED_SAMPLES_PER_OPERATOR) {
+            return null
         }
 
-        val fetchedPrices = runCatching {
-            fetchCountryOperatorPriceMap(
-                countryCode = countryCode,
-                gbpToEurRate = gbpToEurRate
-            )
-        }.getOrDefault(emptyMap())
+        val avgEuro = entry.samples.map { it.euroPerKwh }.average()
+        val avgOriginal = entry.samples.map { it.originalPricePerKwh }.average()
+        val dominantCurrency = entry.samples
+            .groupingBy { it.originalCurrency }
+            .eachCount()
+            .maxByOrNull { it.value }
+            ?.key
+            ?: "EUR"
 
-        val refreshed = CountryCache(
+        return Match(
+            euroPerKwh = avgEuro,
+            originalPricePerKwh = avgOriginal,
+            originalCurrency = dominantCurrency,
+            sourceLabel = "Chargetrip build-cache $countryCode (${entry.samples.size}/$REQUIRED_SAMPLES_PER_OPERATOR samples)"
+        )
+    }
+
+    private suspend fun resolveCountryCodeWithHint(countryCodeHint: String?, latitude: Double, longitude: Double): String {
+        val hint = countryCodeHint?.trim()?.uppercase(Locale.US).orEmpty()
+        if (isCountryCode(hint)) return hint
+        val resolved = resolveCountryCodeForLocation(latitude, longitude)
+        return if (isCountryCode(resolved)) resolved else ""
+    }
+
+    private fun ensureCountryOperatorListCache(countryCode: String): CountryOperatorListCache {
+        val now = System.currentTimeMillis()
+        val inMemory = inMemoryOperatorListCache
+        if (inMemory != null && inMemory.countryCode == countryCode && isFresh(inMemory.updatedAtEpochMs, now) && inMemory.operatorsByNormalizedName.isNotEmpty()) {
+            return inMemory
+        }
+
+        val disk = readOperatorListCacheFromDisk(countryCode)
+        if (disk != null && isFresh(disk.updatedAtEpochMs, now) && disk.operatorsByNormalizedName.isNotEmpty()) {
+            inMemoryOperatorListCache = disk
+            return disk
+        }
+
+        val fetched = fetchOperatorListFromApi(countryCode)
+        inMemoryOperatorListCache = fetched
+        writeOperatorListCacheToDisk(fetched)
+        return fetched
+    }
+
+    private fun loadBuildCache(countryCode: String): CountryOperatorPriceBuildCache {
+        val now = System.currentTimeMillis()
+        val inMemory = inMemoryBuildCache
+        if (inMemory != null && inMemory.countryCode == countryCode) {
+            if (!isFresh(inMemory.updatedAtEpochMs, now)) {
+                inMemory.entriesByNormalizedName.clear()
+                inMemory.updatedAtEpochMs = now
+                writeBuildCacheToDisk(inMemory)
+            }
+            return inMemory
+        }
+
+        val disk = readBuildCacheFromDisk(countryCode)
+        if (disk != null) {
+            if (!isFresh(disk.updatedAtEpochMs, now)) {
+                disk.entriesByNormalizedName.clear()
+                disk.updatedAtEpochMs = now
+                writeBuildCacheToDisk(disk)
+            }
+            inMemoryBuildCache = disk
+            return disk
+        }
+
+        val empty = CountryOperatorPriceBuildCache(
             countryCode = countryCode,
             updatedAtEpochMs = now,
-            pricesByNormalizedOperator = fetchedPrices
+            entriesByNormalizedName = mutableMapOf()
         )
-        inMemoryCache = refreshed
-        writeCacheToDisk(refreshed)
-        return refreshed
+        inMemoryBuildCache = empty
+        writeBuildCacheToDisk(empty)
+        return empty
     }
 
-    private fun isFresh(updatedAtMs: Long, nowMs: Long): Boolean = nowMs - updatedAtMs <= CACHE_TTL_MS
+    private fun fetchOperatorListFromApi(countryCode: String): CountryOperatorListCache {
+        val map = linkedMapOf<String, OperatorRef>()
+        var page = 0
 
-    private fun cacheFile(countryCode: String): File? {
-        val normalized = countryCode.uppercase(Locale.US).ifBlank { "XX" }
-        return storageDir?.resolve("${CACHE_FILE_PREFIX}_${normalized}.json")
-    }
-
-    private fun readCacheFromDisk(countryCode: String): CountryCache? {
-        val file = cacheFile(countryCode) ?: return null
-        if (!file.exists()) return null
-        return runCatching {
-            val root = JSONObject(file.readText(Charsets.UTF_8))
-            val parsedCountryCode = root.optString("countryCode", "").uppercase(Locale.US)
-            val updatedAt = root.optLong("updatedAtEpochMs", 0L)
-            val prices = root.optJSONArray("operatorPrices") ?: return@runCatching null
-
-            val map = mutableMapOf<String, OperatorPrice>()
-            for (i in 0 until prices.length()) {
-                val obj = prices.optJSONObject(i) ?: continue
-                val operatorName = obj.optString("operatorName", "").trim()
-                val euro = obj.optDouble("euroPerKwh", Double.NaN)
-                val original = obj.optDouble("originalPricePerKwh", Double.NaN)
-                val currency = obj.optString("originalCurrency", "").uppercase(Locale.US)
-                val sampleCount = obj.optInt("sampleCount", 1)
-                if (operatorName.isBlank() || euro.isNaN() || original.isNaN() || currency.isBlank()) continue
-                map[normalize(operatorName)] = OperatorPrice(
-                    operatorName = operatorName,
-                    euroPerKwh = euro,
-                    originalPricePerKwh = original,
-                    originalCurrency = currency,
-                    sampleCount = sampleCount
-                )
-            }
-
-            if (parsedCountryCode.isBlank() || updatedAt <= 0L) return@runCatching null
-            CountryCache(parsedCountryCode, updatedAt, map)
-        }.getOrNull()
-    }
-
-    private fun writeCacheToDisk(cache: CountryCache) {
-        val file = cacheFile(cache.countryCode) ?: return
-        runCatching {
-            val array = org.json.JSONArray()
-            cache.pricesByNormalizedOperator.values
-                .sortedBy { it.operatorName.lowercase(Locale.US) }
-                .forEach { value ->
-                    array.put(
-                        JSONObject()
-                            .put("operatorName", value.operatorName)
-                            .put("euroPerKwh", value.euroPerKwh)
-                            .put("originalPricePerKwh", value.originalPricePerKwh)
-                            .put("originalCurrency", value.originalCurrency)
-                            .put("sampleCount", value.sampleCount)
-                    )
-                }
-            val root = JSONObject()
-                .put("countryCode", cache.countryCode)
-                .put("updatedAtEpochMs", cache.updatedAtEpochMs)
-                .put("operatorPrices", array)
-
-            file.parentFile?.mkdirs()
-            file.writeText(root.toString(), Charsets.UTF_8)
-        }
-    }
-
-    private fun resolveCountryCode(latitude: Double, longitude: Double): String {
-        val query = """
-            query {
-              stationAround(
-                filter: {
-                  location: { type: Point, coordinates: [${formatCoordinate(longitude)}, ${formatCoordinate(latitude)}] },
-                  distance: $COUNTRY_RESOLVE_DISTANCE_METERS
-                }
-              ) {
-                country_code
-                country
-                physical_address { country }
-              }
-            }
-        """.trimIndent()
-
-        val data = runCatching {
-            postGraphQl(JSONObject().put("query", query).toString())
-                .optJSONObject("data")
-        }.getOrNull() ?: return ""
-
-        val stations = data.optJSONArray("stationAround") ?: return ""
-        for (i in 0 until stations.length()) {
-            val station = stations.optJSONObject(i) ?: continue
-            val direct = station.optString("country_code", "").trim()
-            if (isCountryCode(direct)) return direct.uppercase(Locale.US)
-
-            val fallback = station.optString("country", "").trim()
-            if (isCountryCode(fallback)) return fallback.uppercase(Locale.US)
-
-            val addrCountry = station.optJSONObject("physical_address")
-                ?.optString("country", "")
-                ?.trim()
-                .orEmpty()
-            if (isCountryCode(addrCountry)) return addrCountry.uppercase(Locale.US)
-        }
-
-        return ""
-    }
-
-    private fun fetchCountryOperatorPriceMap(
-        countryCode: String,
-        gbpToEurRate: Double?
-    ): Map<String, OperatorPrice> {
-        val operators = fetchOperatorNames(countryCode)
-        if (operators.isEmpty()) return emptyMap()
-
-        val result = mutableMapOf<String, OperatorPrice>()
-        for (operatorName in operators) {
-            val price = fetchOperatorAverageFromSingleStationPage(
-                countryCode = countryCode,
-                operatorName = operatorName,
-                gbpToEurRate = gbpToEurRate
-            ) ?: continue
-            result[normalize(operatorName)] = price
-        }
-        return result
-    }
-
-    private fun fetchOperatorNames(countryCode: String): List<String> {
-        val allNames = mutableSetOf<String>()
-        for (page in 0 until OPERATOR_MAX_PAGES) {
+        while (true) {
             val query = """
                 query {
                   operatorList(
@@ -250,6 +283,7 @@ class ChargetripPricingClient(
                     size: $OPERATOR_PAGE_SIZE,
                     page: $page
                   ) {
+                    id
                     name
                   }
                 }
@@ -263,29 +297,43 @@ class ChargetripPricingClient(
             if (items.length() == 0) break
 
             for (i in 0 until items.length()) {
-                val name = items.optJSONObject(i)?.optString("name", "")?.trim().orEmpty()
-                if (name.isNotBlank()) allNames.add(name)
+                val op = items.optJSONObject(i) ?: continue
+                val name = op.optString("name", "").trim()
+                if (name.isBlank()) continue
+                val normalized = normalize(name)
+                if (normalized.isBlank()) continue
+                val id = op.optString("id", "").trim().ifBlank { null }
+                map.putIfAbsent(normalized, OperatorRef(id = id, name = name, normalizedName = normalized))
             }
 
             if (items.length() < OPERATOR_PAGE_SIZE) break
+            page += 1
         }
-        return allNames.toList()
+
+        return CountryOperatorListCache(
+            countryCode = countryCode,
+            updatedAtEpochMs = System.currentTimeMillis(),
+            operatorsByNormalizedName = map,
+            uniqueKeywordToOperatorNormalizedName = buildUniqueKeywordIndex(map)
+        )
     }
 
-    private fun fetchOperatorAverageFromSingleStationPage(
-        countryCode: String,
-        operatorName: String,
-        gbpToEurRate: Double?
-    ): OperatorPrice? {
-        val escapedSearch = operatorName.replace("\"", "\\\"")
+    private fun fetchSingleStationSample(
+        operatorRef: OperatorRef,
+        searchQuery: String,
+        gbpToEurRate: Double?,
+        stationKey: String,
+        now: Long
+    ): OperatorPriceSample? {
+        val escapedSearch = searchQuery.replace("\"", "\\\"")
         val query = """
             query {
               stationList(
-                filter: { countries: [$countryCode] },
                 search: "$escapedSearch",
                 size: $STATION_PAGE_SIZE,
                 page: 0
               ) {
+                name
                 operator { name }
                 chargers { price }
               }
@@ -299,41 +347,28 @@ class ChargetripPricingClient(
         val stations = data.optJSONArray("stationList") ?: return null
         if (stations.length() == 0) return null
 
-        val normalizedTarget = normalize(operatorName)
-        var sumEuro = 0.0
-        var sumOriginal = 0.0
-        var sampleCount = 0
-        var currency: String? = null
-
         for (i in 0 until stations.length()) {
             val station = stations.optJSONObject(i) ?: continue
             val stationOperatorName = station.optJSONObject("operator")?.optString("name", "")?.trim().orEmpty()
-            val normalizedStationOperator = normalize(stationOperatorName)
-            if (normalizedStationOperator != normalizedTarget) continue
+            if (!operatorsLikelyMatch(operatorRef.normalizedName, normalize(stationOperatorName))) continue
 
             val chargers = station.optJSONArray("chargers") ?: continue
             val parsed = findPriceInChargers(chargers, gbpToEurRate) ?: continue
 
-            if (currency != null && currency != parsed.third) continue
-            currency = parsed.third
-            sumEuro += parsed.first
-            sumOriginal += parsed.second
-            sampleCount += 1
+            return OperatorPriceSample(
+                stationKey = stationKey,
+                euroPerKwh = parsed.first,
+                originalPricePerKwh = parsed.second,
+                originalCurrency = parsed.third,
+                capturedAtEpochMs = now
+            )
         }
 
-        if (sampleCount == 0 || currency == null) return null
-
-        return OperatorPrice(
-            operatorName = operatorName,
-            euroPerKwh = sumEuro / sampleCount,
-            originalPricePerKwh = sumOriginal / sampleCount,
-            originalCurrency = currency,
-            sampleCount = sampleCount
-        )
+        return null
     }
 
     private fun findPriceInChargers(
-        chargers: org.json.JSONArray,
+        chargers: JSONArray,
         gbpToEurRate: Double?
     ): Triple<Double, Double, String>? {
         for (i in 0 until chargers.length()) {
@@ -356,8 +391,8 @@ class ChargetripPricingClient(
 
         if (!normalized.contains("kwh")) return null
 
-        val hasEur = normalized.contains("€") || normalized.contains("eur")
-        val hasGbp = normalized.contains("£") || normalized.contains("gbp")
+        val hasEur = normalized.contains("\u20ac") || normalized.contains("eur")
+        val hasGbp = normalized.contains("\u00a3") || normalized.contains("gbp")
         val value = Regex("(\\d+(?:\\.\\d+)?)").find(normalized)?.groupValues?.get(1)?.toDoubleOrNull() ?: return null
 
         return when {
@@ -370,43 +405,20 @@ class ChargetripPricingClient(
         }
     }
 
-    private fun pickBestOperatorPrice(
-        pricesByOperator: Map<String, OperatorPrice>,
-        normalizedOperator: String,
-        normalizedSite: String
-    ): OperatorPrice? {
-        var best: OperatorPrice? = null
-        var bestScore = Int.MIN_VALUE
-
-        for ((normalizedName, price) in pricesByOperator) {
-            var score = 0
-            if (normalizedOperator.isNotBlank()) {
-                if (normalizedName == normalizedOperator) score += 100
-                else if (normalizedName.contains(normalizedOperator) || normalizedOperator.contains(normalizedName)) score += 70
-            }
-            if (normalizedSite.isNotBlank()) {
-                if (normalizedSite.contains(normalizedName)) score += 35
-            }
-            score += price.sampleCount.coerceAtMost(20)
-
-            if (score > bestScore) {
-                bestScore = score
-                best = price
-            }
-        }
-
-        if (bestScore <= 0) return null
-        return best
-    }
-
     private fun postGraphQl(body: String): JSONObject {
-        val connection = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(CHARGETRIP_ENDPOINT).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Accept", "application/json")
             setRequestProperty("x-client-id", clientId)
             setRequestProperty("x-app-id", appId)
+            if (appIdentifier.isNotBlank()) {
+                setRequestProperty("x-app-identifier", appIdentifier)
+            }
+            if (appFingerprint.isNotBlank()) {
+                setRequestProperty("x-app-fingerprint", appFingerprint)
+            }
             connectTimeout = CONNECT_TIMEOUT_MS
             readTimeout = READ_TIMEOUT_MS
         }
@@ -417,12 +429,288 @@ class ChargetripPricingClient(
             val response = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             val json = JSONObject(response)
             if (json.has("errors")) {
-                throw IllegalStateException("Chargetrip GraphQL returned errors.")
+                val errors = json.optJSONArray("errors")
+                val summarized = buildList {
+                    if (errors != null) {
+                        for (i in 0 until errors.length()) {
+                            val item = errors.optJSONObject(i) ?: continue
+                            val message = item.optString("message", "").trim()
+                            if (message.isNotBlank()) add(message)
+                        }
+                    }
+                }
+                val summary = summarized.distinct().take(3).joinToString(" | ").ifBlank {
+                    "Chargetrip GraphQL returned errors."
+                }
+                throw IllegalStateException(summary)
+            }
+            if (connection.responseCode !in 200..299) {
+                throw IllegalStateException("HTTP ${connection.responseCode}: ${response.take(220)}")
             }
             json
         } finally {
             connection.disconnect()
         }
+    }
+
+    private fun resolveCountryCodeViaNominatim(latitude: Double, longitude: Double): String {
+        val url = "$NOMINATIM_REVERSE_ENDPOINT?format=jsonv2&lat=${formatCoordinate(latitude)}&lon=${formatCoordinate(longitude)}&zoom=3&addressdetails=1"
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("User-Agent", "SkylarkinEVFinder/1.0 (country-cache)")
+            connectTimeout = CONNECT_TIMEOUT_MS
+            readTimeout = READ_TIMEOUT_MS
+        }
+
+        return try {
+            val stream = if (connection.responseCode in 200..299) connection.inputStream else connection.errorStream
+            val response = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            if (connection.responseCode !in 200..299) return ""
+            val json = JSONObject(response)
+            val address = json.optJSONObject("address")
+            val countryCode = address?.optString("country_code", "")?.trim().orEmpty()
+            if (isCountryCode(countryCode)) countryCode.uppercase(Locale.US) else ""
+        } catch (_: Exception) {
+            ""
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun operatorListCacheFile(countryCode: String): File? {
+        val normalized = countryCode.uppercase(Locale.US).ifBlank { "XX" }
+        return storageDir?.resolve("${OPERATOR_LIST_CACHE_PREFIX}_${normalized}.json")
+    }
+
+    private fun buildCacheFile(countryCode: String): File? {
+        val normalized = countryCode.uppercase(Locale.US).ifBlank { "XX" }
+        return storageDir?.resolve("${OPERATOR_PRICE_BUILD_CACHE_PREFIX}_${normalized}.json")
+    }
+
+    private fun readOperatorListCacheFromDisk(countryCode: String): CountryOperatorListCache? {
+        val file = operatorListCacheFile(countryCode) ?: return null
+        if (!file.exists()) return null
+
+        return runCatching {
+            val root = JSONObject(file.readText(Charsets.UTF_8))
+            val parsedCountryCode = root.optString("countryCode", "").uppercase(Locale.US)
+            val updatedAt = root.optLong("updatedAtEpochMs", 0L)
+            val operators = root.optJSONArray("operators") ?: return@runCatching null
+
+            val map = linkedMapOf<String, OperatorRef>()
+            for (i in 0 until operators.length()) {
+                val obj = operators.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "").trim().ifBlank { null }
+                val name = obj.optString("name", "").trim()
+                val normalizedName = normalize(name)
+                if (name.isBlank() || normalizedName.isBlank()) continue
+                map[normalizedName] = OperatorRef(id = id, name = name, normalizedName = normalizedName)
+            }
+            val keywordsJson = root.optJSONArray("uniqueKeywords")
+            val keywordMap = mutableMapOf<String, String>()
+            if (keywordsJson != null) {
+                for (i in 0 until keywordsJson.length()) {
+                    val obj = keywordsJson.optJSONObject(i) ?: continue
+                    val keyword = normalize(obj.optString("keyword", ""))
+                    val normalizedOperatorName = normalize(obj.optString("operatorNormalizedName", ""))
+                    if (keyword.isBlank() || normalizedOperatorName.isBlank()) continue
+                    if (!map.containsKey(normalizedOperatorName)) continue
+                    keywordMap[keyword] = normalizedOperatorName
+                }
+            }
+            val effectiveKeywordMap =
+                if (keywordMap.isNotEmpty()) keywordMap else buildUniqueKeywordIndex(map)
+
+            if (!isCountryCode(parsedCountryCode) || updatedAt <= 0L) return@runCatching null
+            CountryOperatorListCache(
+                countryCode = parsedCountryCode,
+                updatedAtEpochMs = updatedAt,
+                operatorsByNormalizedName = map,
+                uniqueKeywordToOperatorNormalizedName = effectiveKeywordMap
+            )
+        }.getOrNull()
+    }
+
+    private fun writeOperatorListCacheToDisk(cache: CountryOperatorListCache) {
+        val file = operatorListCacheFile(cache.countryCode) ?: return
+        runCatching {
+            val operatorsArray = JSONArray()
+            cache.operatorsByNormalizedName.values
+                .sortedBy { it.name.lowercase(Locale.US) }
+                .forEach { op ->
+                    operatorsArray.put(
+                        JSONObject()
+                            .put("id", op.id ?: "")
+                            .put("name", op.name)
+                    )
+                }
+            val keywordsArray = JSONArray()
+            cache.uniqueKeywordToOperatorNormalizedName.entries
+                .sortedBy { it.key }
+                .forEach { (keyword, normalizedOperatorName) ->
+                    keywordsArray.put(
+                        JSONObject()
+                            .put("keyword", keyword)
+                            .put("operatorNormalizedName", normalizedOperatorName)
+                    )
+                }
+
+            val root = JSONObject()
+                .put("countryCode", cache.countryCode)
+                .put("updatedAtEpochMs", cache.updatedAtEpochMs)
+                .put("operators", operatorsArray)
+                .put("uniqueKeywords", keywordsArray)
+
+            file.parentFile?.mkdirs()
+            file.writeText(root.toString(), Charsets.UTF_8)
+        }
+    }
+
+    private fun readBuildCacheFromDisk(countryCode: String): CountryOperatorPriceBuildCache? {
+        val file = buildCacheFile(countryCode) ?: return null
+        if (!file.exists()) return null
+
+        return runCatching {
+            val root = JSONObject(file.readText(Charsets.UTF_8))
+            val parsedCountryCode = root.optString("countryCode", "").uppercase(Locale.US)
+            val updatedAt = root.optLong("updatedAtEpochMs", 0L)
+            val entriesArray = root.optJSONArray("operatorEntries") ?: JSONArray()
+
+            val map = mutableMapOf<String, OperatorPriceEntry>()
+            for (i in 0 until entriesArray.length()) {
+                val obj = entriesArray.optJSONObject(i) ?: continue
+                val operatorId = obj.optString("operatorId", "").trim().ifBlank { null }
+                val operatorName = obj.optString("operatorName", "").trim()
+                val normalizedOperatorName = normalize(operatorName)
+                if (normalizedOperatorName.isBlank()) continue
+                val entryUpdatedAt = obj.optLong("updatedAtEpochMs", updatedAt)
+                val samplesJson = obj.optJSONArray("samples") ?: JSONArray()
+                val samples = mutableListOf<OperatorPriceSample>()
+                for (j in 0 until samplesJson.length()) {
+                    val s = samplesJson.optJSONObject(j) ?: continue
+                    val stationKey = s.optString("stationKey", "").trim()
+                    val eur = s.optDouble("euroPerKwh", Double.NaN)
+                    val original = s.optDouble("originalPricePerKwh", Double.NaN)
+                    val currency = s.optString("originalCurrency", "").trim().uppercase(Locale.US)
+                    val captured = s.optLong("capturedAtEpochMs", entryUpdatedAt)
+                    if (stationKey.isBlank() || eur.isNaN() || original.isNaN() || currency.isBlank()) continue
+                    samples.add(
+                        OperatorPriceSample(
+                            stationKey = stationKey,
+                            euroPerKwh = eur,
+                            originalPricePerKwh = original,
+                            originalCurrency = currency,
+                            capturedAtEpochMs = captured
+                        )
+                    )
+                }
+                map[normalizedOperatorName] = OperatorPriceEntry(
+                    operatorId = operatorId,
+                    operatorName = operatorName.ifBlank { normalizedOperatorName },
+                    normalizedOperatorName = normalizedOperatorName,
+                    samples = samples,
+                    updatedAtEpochMs = entryUpdatedAt
+                )
+            }
+
+            if (!isCountryCode(parsedCountryCode) || updatedAt <= 0L) return@runCatching null
+            CountryOperatorPriceBuildCache(parsedCountryCode, updatedAt, map)
+        }.getOrNull()
+    }
+
+    private fun writeBuildCacheToDisk(cache: CountryOperatorPriceBuildCache) {
+        val file = buildCacheFile(cache.countryCode) ?: return
+        runCatching {
+            val entriesArray = JSONArray()
+            cache.entriesByNormalizedName.values
+                .sortedBy { it.operatorName.lowercase(Locale.US) }
+                .forEach { entry ->
+                    val samplesArray = JSONArray()
+                    entry.samples.forEach { sample ->
+                        samplesArray.put(
+                            JSONObject()
+                                .put("stationKey", sample.stationKey)
+                                .put("euroPerKwh", sample.euroPerKwh)
+                                .put("originalPricePerKwh", sample.originalPricePerKwh)
+                                .put("originalCurrency", sample.originalCurrency)
+                                .put("capturedAtEpochMs", sample.capturedAtEpochMs)
+                        )
+                    }
+                    entriesArray.put(
+                        JSONObject()
+                            .put("operatorId", entry.operatorId ?: "")
+                            .put("operatorName", entry.operatorName)
+                            .put("updatedAtEpochMs", entry.updatedAtEpochMs)
+                            .put("samples", samplesArray)
+                    )
+                }
+
+            val root = JSONObject()
+                .put("countryCode", cache.countryCode)
+                .put("updatedAtEpochMs", cache.updatedAtEpochMs)
+                .put("requiredSamplesPerOperator", REQUIRED_SAMPLES_PER_OPERATOR)
+                .put("operatorEntries", entriesArray)
+
+            file.parentFile?.mkdirs()
+            file.writeText(root.toString(), Charsets.UTF_8)
+        }
+    }
+
+    private fun buildStationKey(stationExternalId: String?, stationName: String?): String {
+        val idKey = stationExternalId?.trim().orEmpty()
+        if (idKey.isNotBlank()) return "id:$idKey"
+        val nameKey = normalize(stationName)
+        return if (nameKey.isBlank()) "unknown" else "name:$nameKey"
+    }
+
+    private fun resolveOperatorRefFromOcmOperator(
+        normalizedOcmOperatorName: String,
+        operatorListCache: CountryOperatorListCache
+    ): OperatorRef? {
+        operatorListCache.operatorsByNormalizedName[normalizedOcmOperatorName]?.let { return it }
+
+        val tokens = normalizedOcmOperatorName
+            .split(' ')
+            .map { it.trim() }
+            .filter { it.length >= 3 }
+            .toSet()
+        if (tokens.isEmpty()) return null
+
+        val matchedNormalizedOperators = tokens
+            .mapNotNull { token -> operatorListCache.uniqueKeywordToOperatorNormalizedName[token] }
+            .distinct()
+
+        if (matchedNormalizedOperators.size != 1) return null
+        return operatorListCache.operatorsByNormalizedName[matchedNormalizedOperators.first()]
+    }
+
+    private fun buildUniqueKeywordIndex(
+        operatorsByNormalizedName: Map<String, OperatorRef>
+    ): Map<String, String> {
+        val tokenToOperators = mutableMapOf<String, MutableSet<String>>()
+        operatorsByNormalizedName.values.forEach { operator ->
+            val tokens = operator.normalizedName
+                .split(' ')
+                .map { it.trim() }
+                .filter { it.length >= 3 && it !in genericOperatorTokens }
+                .toSet()
+            tokens.forEach { token ->
+                tokenToOperators.getOrPut(token) { mutableSetOf() }.add(operator.normalizedName)
+            }
+        }
+
+        return tokenToOperators
+            .filter { (_, owners) -> owners.size == 1 }
+            .mapValues { (_, owners) -> owners.first() }
+    }
+
+    private fun operatorsLikelyMatch(target: String, candidate: String): Boolean {
+        if (target.isBlank() || candidate.isBlank()) return false
+        if (target == candidate) return true
+        if (target.length >= 4 && candidate.contains(target)) return true
+        if (candidate.length >= 4 && target.contains(candidate)) return true
+        return false
     }
 
     private fun formatCoordinate(value: Double): String = String.format(Locale.US, "%.6f", value)
@@ -435,21 +723,40 @@ class ChargetripPricingClient(
             .orEmpty()
     }
 
+    private val genericOperatorTokens = setOf(
+        "the",
+        "and",
+        "for",
+        "with",
+        "group",
+        "energy",
+        "electric",
+        "electricity",
+        "charging",
+        "charge",
+        "network",
+        "solutions",
+        "solution",
+        "services",
+        "service",
+        "limited",
+        "ltd",
+        "plc",
+        "ireland",
+        "uk",
+        "ie",
+        "ev"
+    )
+
+    private fun isFresh(updatedAtMs: Long, nowMs: Long): Boolean = nowMs - updatedAtMs <= CACHE_TTL_MS
+
     private fun isCountryCode(value: String): Boolean {
         return value.length == 2 && value.all { it.isLetter() }
     }
 
-    @Suppress("unused")
-    private fun haversineDistanceKm(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): Double {
-        val earthRadiusKm = 6371.0
-        val dLat = Math.toRadians(toLat - fromLat)
-        val dLon = Math.toRadians(toLon - fromLon)
-        val lat1 = Math.toRadians(fromLat)
-        val lat2 = Math.toRadians(toLat)
-
-        val a = kotlin.math.sin(dLat / 2).pow(2.0) +
-            kotlin.math.sin(dLon / 2).pow(2.0) * kotlin.math.cos(lat1) * kotlin.math.cos(lat2)
-        val c = 2 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
-        return earthRadiusKm * c
+    private fun countryLookupKey(latitude: Double, longitude: Double): String {
+        val latKey = String.format(Locale.US, "%.1f", latitude)
+        val lonKey = String.format(Locale.US, "%.1f", longitude)
+        return "$latKey,$lonKey"
     }
 }
