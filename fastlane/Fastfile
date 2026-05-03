@@ -25,7 +25,7 @@ platform :android do
     end
 
     metadata_android_path = File.expand_path("metadata/android", __dir__)
-    ["en-GB", "en-US"].each do |locale|
+    ["en-GB"].each do |locale|
       changelog_dir = File.join(metadata_android_path, locale, "changelogs")
       FileUtils.mkdir_p(changelog_dir)
       File.write("#{changelog_dir}/#{next_code}.txt", release_note)
