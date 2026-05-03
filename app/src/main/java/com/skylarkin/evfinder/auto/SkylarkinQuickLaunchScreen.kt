@@ -47,6 +47,7 @@ class SkylarkinQuickLaunchScreen(
     private var errorMessage: String? = null
     private var matches: List<ChargePoint> = emptyList()
     private var csvOnly = true
+    private var requireShowers = false
     private var lastKnownLocation: Location? = null
     private var pendingDirectionLaunch: String? = null
 
@@ -125,6 +126,7 @@ class SkylarkinQuickLaunchScreen(
                 .build()
         )
         listBuilder.addItem(sleepRow())
+        listBuilder.addItem(requireShowersRow())
 
         return ListTemplate.Builder()
             .setHeader(
@@ -260,14 +262,23 @@ class SkylarkinQuickLaunchScreen(
 
             lastKnownLocation = location
             val nearest = runCatching {
-                sleepSpotClient.findNearestSleepSpot(location.latitude, location.longitude)
+                sleepSpotClient.findNearestSleepSpot(
+                    userLatitude = location.latitude,
+                    userLongitude = location.longitude,
+                    requireShowers = requireShowers
+                )
             }.getOrNull()
 
             carContext.mainExecutor.execute {
                 if (nearest == null) {
+                    val criteria = if (requireShowers) {
+                        "free, overnight, open-today, shower"
+                    } else {
+                        "free, overnight, open-today"
+                    }
                     CarToast.makeText(
                         carContext,
-                        "No OSM sleep spot matched (free, overnight, year-round, shower).",
+                        "No OSM sleep spot matched ($criteria).",
                         CarToast.LENGTH_SHORT
                     ).show()
                 } else {
@@ -275,6 +286,20 @@ class SkylarkinQuickLaunchScreen(
                 }
             }
         }
+    }
+
+    private fun requireShowersRow(): Row {
+        return Row.Builder()
+            .setTitle("Require showers")
+            .setToggle(
+                Toggle.Builder { isChecked ->
+                    requireShowers = isChecked
+                    invalidate()
+                }
+                    .setChecked(requireShowers)
+                    .build()
+            )
+            .build()
     }
 
     private fun navigateToChargePoint(target: ChargePoint) {

@@ -29,11 +29,15 @@ class OsmSleepSpotClient {
         val RADIUS_STEPS_METERS = intArrayOf(20_000, 50_000, 100_000)
     }
 
-    suspend fun findNearestSleepSpot(userLatitude: Double, userLongitude: Double): OsmSleepSpot? {
+    suspend fun findNearestSleepSpot(
+        userLatitude: Double,
+        userLongitude: Double,
+        requireShowers: Boolean
+    ): OsmSleepSpot? {
         return withContext(Dispatchers.IO) {
             for (radius in RADIUS_STEPS_METERS) {
                 val nearest = runCatching {
-                    findNearestWithinRadius(userLatitude, userLongitude, radius)
+                    findNearestWithinRadius(userLatitude, userLongitude, radius, requireShowers)
                 }.getOrNull()
                 if (nearest != null) return@withContext nearest
             }
@@ -44,7 +48,8 @@ class OsmSleepSpotClient {
     private fun findNearestWithinRadius(
         userLatitude: Double,
         userLongitude: Double,
-        radiusMeters: Int
+        radiusMeters: Int,
+        requireShowers: Boolean
     ): OsmSleepSpot? {
         val payload = "data=" + URLEncoder.encode(
             buildOverpassQuery(userLatitude, userLongitude, radiusMeters),
@@ -89,7 +94,7 @@ class OsmSleepSpotClient {
             val tags = element.optJSONObject("tags") ?: JSONObject()
 
             if (!isFree(tags)) continue
-            if (!hasShowerAccess(tags)) continue
+            if (requireShowers && !hasShowerAccess(tags)) continue
             if (!supportsOvernight(tags)) continue
             if (!isOpenToday(tags)) continue
 
