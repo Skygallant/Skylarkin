@@ -36,7 +36,7 @@ class SkylarkinQuickLaunchScreen(
     private companion object {
         const val USE_DETAILED_LOADING_MESSAGES = false
         const val SIMPLE_LOADING_MESSAGE = "Searching nearby chargepoints..."
-        const val AUTO_MAX_COMBINED_SCORE = 6.0
+        const val AUTO_MAX_COMBINED_SCORE = 4.0
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)

@@ -169,7 +169,7 @@ class MainActivity : AppCompatActivity() {
 
                             result.onSuccess { chargePoints ->
                                 currentResults = chargePoints
-                                renderCurrentResults()
+                                val visibleCount = renderCurrentResults()
                                 if (chargePoints.isEmpty()) {
                                     showStatus(
                                         "No chargepoints found with all filters (Type 2, public 24/7, within 50 km).",
@@ -178,7 +178,7 @@ class MainActivity : AppCompatActivity() {
                                     )
                                 } else {
                                     showStatus(
-                                        "Found ${chargePoints.size} matching chargepoints. Tap one to open Google Maps.",
+                                        "Found $visibleCount matching chargepoints. Tap one to open Google Maps.",
                                         showRetry = true,
                                         loading = false
                                     )
@@ -240,7 +240,7 @@ class MainActivity : AppCompatActivity() {
         ) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun renderCurrentResults() {
+    private fun renderCurrentResults(): Int {
         val maxScore = selectedMaxCombinedScore()
         val scoreFiltered = currentResults.filter { point ->
             point.combinedCostScore?.let { it <= maxScore } ?: true
@@ -259,13 +259,21 @@ class MainActivity : AppCompatActivity() {
             unknownFleetFiltered.sortedBy { it.distanceKm }
         }
         adapter.submitList(sorted)
+        if (currentResults.isNotEmpty() && progressBar.visibility != View.VISIBLE) {
+            showStatus(
+                "Found ${sorted.size} matching chargepoints. Tap one to open Google Maps.",
+                showRetry = true,
+                loading = false
+            )
+        }
+        return sorted.size
     }
 
     private fun selectedMaxCombinedScore(): Double = scoreSlider.value.toDouble()
 
     private fun updateScoreValueLabel() {
         val score = scoreSlider.value.toInt()
-        scoreValueText.text = String.format(Locale.US, "Max combined cost score: %d/10", score)
+        scoreValueText.text = String.format(Locale.US, "Cost score: %d/10", score)
     }
 
     private fun showStatus(text: String, showRetry: Boolean, loading: Boolean) {
