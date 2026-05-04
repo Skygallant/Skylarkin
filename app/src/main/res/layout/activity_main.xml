@@ -32,6 +32,34 @@
         app:layout_constraintStart_toStartOf="@id/titleText"
         app:layout_constraintTop_toBottomOf="@id/titleText" />
 
+    <TextView
+        android:id="@+id/scoreValueText"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="10dp"
+        android:layout_marginEnd="20dp"
+        android:textColor="@color/meta_text"
+        android:textSize="14sp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/subtitleText" />
+
+    <com.google.android.material.slider.Slider
+        android:id="@+id/scoreSlider"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="20dp"
+        android:layout_marginTop="4dp"
+        android:layout_marginEnd="20dp"
+        android:stepSize="1"
+        android:value="10"
+        android:valueFrom="1"
+        android:valueTo="10"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/scoreValueText" />
+
     <androidx.appcompat.widget.SwitchCompat
         android:id="@+id/sortToggle"
         android:layout_width="wrap_content"
@@ -40,9 +68,23 @@
         android:checked="true"
         android:text="Farthest first"
         android:textColor="@color/meta_text"
-        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/hideUnknownFleetToggle"
+        app:layout_constraintHorizontal_chainStyle="packed"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toBottomOf="@id/subtitleText" />
+        app:layout_constraintTop_toBottomOf="@id/scoreSlider" />
+
+    <androidx.appcompat.widget.SwitchCompat
+        android:id="@+id/hideUnknownFleetToggle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="8dp"
+        android:checked="false"
+        android:text="@string/hide_unknown_fleet"
+        android:textColor="@color/meta_text"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toEndOf="@id/sortToggle"
+        app:layout_constraintTop_toTopOf="@id/sortToggle" />
 
     <ProgressBar
         android:id="@+id/progressBar"

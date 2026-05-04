@@ -16,6 +16,7 @@ import androidx.car.app.model.Toggle
 import com.google.android.gms.location.LocationServices
 import com.skylarkin.evfinder.BuildConfig
 import com.skylarkin.evfinder.ChargePoint
+import com.skylarkin.evfinder.OcmOperatorScoreCatalog
 import com.skylarkin.evfinder.OpenChargeMapClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,9 +36,11 @@ class SkylarkinQuickLaunchScreen(
     private companion object {
         const val USE_DETAILED_LOADING_MESSAGES = false
         const val SIMPLE_LOADING_MESSAGE = "Searching nearby chargepoints..."
+        const val AUTO_MAX_COMBINED_SCORE = 6.0
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val operatorScoreCatalog = OcmOperatorScoreCatalog.fromAssets(carContext)
     private val chargeMapClient: OpenChargeMapClient
     private val sleepSpotClient = OsmSleepSpotClient()
 
@@ -45,13 +48,15 @@ class SkylarkinQuickLaunchScreen(
     private var loadingStatusText: String = "Preparing search..."
     private var errorMessage: String? = null
     private var matches: List<ChargePoint> = emptyList()
+    private var ignorePriceScoring = false
     private var requireShowers = false
     private var lastKnownLocation: Location? = null
     private var pendingDirectionLaunch: String? = null
 
     init {
         chargeMapClient = OpenChargeMapClient(
-            apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY
+            apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY,
+            operatorScoreCatalog = operatorScoreCatalog
         )
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
@@ -116,8 +121,9 @@ class SkylarkinQuickLaunchScreen(
         listBuilder.addItem(directionRow("S"))
         listBuilder.addItem(directionRow("E"))
         listBuilder.addItem(directionRow("W"))
-        listBuilder.addItem(requireShowersRow())
+        listBuilder.addItem(ignorePriceScoringRow())
         listBuilder.addItem(sleepRow())
+        listBuilder.addItem(requireShowersRow())
 
         return ListTemplate.Builder()
             .setHeader(
@@ -222,7 +228,13 @@ class SkylarkinQuickLaunchScreen(
     }
 
     private fun filteredCandidates(source: List<ChargePoint>): List<ChargePoint> {
-        return source
+        val withoutUnknownAndFleet = source.filter { point ->
+            !point.isFleetOperator && point.combinedCostScore != null
+        }
+        if (ignorePriceScoring) return withoutUnknownAndFleet
+        return withoutUnknownAndFleet.filter { point ->
+            point.combinedCostScore?.let { it <= AUTO_MAX_COMBINED_SCORE } == true
+        }
     }
 
     private fun directionRow(cardinal: String): Row {
@@ -261,6 +273,20 @@ class SkylarkinQuickLaunchScreen(
         return Row.Builder()
             .setTitle("Sleep")
             .setOnClickListener { startSleepNavigation() }
+            .build()
+    }
+
+    private fun ignorePriceScoringRow(): Row {
+        return Row.Builder()
+            .setTitle("Ignore price scoring")
+            .setToggle(
+                Toggle.Builder { isChecked ->
+                    ignorePriceScoring = isChecked
+                    invalidate()
+                }
+                    .setChecked(ignorePriceScoring)
+                    .build()
+            )
             .build()
     }
 

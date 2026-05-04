@@ -19,10 +19,12 @@ import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.gms.location.LocationServices
+import com.google.android.material.slider.Slider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
     private companion object {
@@ -35,11 +37,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var retryButton: Button
     private lateinit var sortToggle: CompoundButton
+    private lateinit var hideUnknownFleetToggle: CompoundButton
+    private lateinit var scoreSlider: Slider
+    private lateinit var scoreValueText: TextView
 
     private val adapter = ChargePointAdapter(::openInGoogleMaps)
+    private val operatorScoreCatalog by lazy { OcmOperatorScoreCatalog.fromAssets(this) }
     private val chargeMapClient by lazy {
         OpenChargeMapClient(
-            apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY
+            apiKey = BuildConfig.OPEN_CHARGE_MAP_API_KEY,
+            operatorScoreCatalog = operatorScoreCatalog
         )
     }
     private var currentResults: List<ChargePoint> = emptyList()
@@ -69,6 +76,9 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         retryButton = findViewById(R.id.retryButton)
         sortToggle = findViewById(R.id.sortToggle)
+        hideUnknownFleetToggle = findViewById(R.id.hideUnknownFleetToggle)
+        scoreSlider = findViewById(R.id.scoreSlider)
+        scoreValueText = findViewById(R.id.scoreValueText)
 
         recyclerView.layoutManager = LinearLayoutManager(this)
         recyclerView.adapter = adapter
@@ -76,6 +86,15 @@ class MainActivity : AppCompatActivity() {
         sortToggle.setOnCheckedChangeListener { _, isChecked ->
             sortToggle.text = if (isChecked) "Farthest first" else "Closest first"
             renderCurrentResults()
+        }
+        hideUnknownFleetToggle.setOnCheckedChangeListener { _, _ ->
+            renderCurrentResults()
+        }
+
+        scoreSlider.stepSize = 1f
+        updateScoreValueLabel()
+        scoreSlider.addOnChangeListener { _, _, _ ->
+            updateScoreValueLabel()
         }
 
         retryButton.setOnClickListener { ensureLocationAndLoad() }
@@ -222,12 +241,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderCurrentResults() {
-        val sorted = if (sortToggle.isChecked) {
-            currentResults.sortedByDescending { it.distanceKm }
+        val maxScore = selectedMaxCombinedScore()
+        val scoreFiltered = currentResults.filter { point ->
+            point.combinedCostScore?.let { it <= maxScore } ?: true
+        }
+        val unknownFleetFiltered = if (hideUnknownFleetToggle.isChecked) {
+            scoreFiltered.filter { point ->
+                !point.isFleetOperator && point.combinedCostScore != null
+            }
         } else {
-            currentResults.sortedBy { it.distanceKm }
+            scoreFiltered
+        }
+
+        val sorted = if (sortToggle.isChecked) {
+            unknownFleetFiltered.sortedByDescending { it.distanceKm }
+        } else {
+            unknownFleetFiltered.sortedBy { it.distanceKm }
         }
         adapter.submitList(sorted)
+    }
+
+    private fun selectedMaxCombinedScore(): Double = scoreSlider.value.toDouble()
+
+    private fun updateScoreValueLabel() {
+        val score = scoreSlider.value.toInt()
+        scoreValueText.text = String.format(Locale.US, "Max combined cost score: %d/10", score)
     }
 
     private fun showStatus(text: String, showRetry: Boolean, loading: Boolean) {

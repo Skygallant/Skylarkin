@@ -17,7 +17,8 @@ import kotlin.math.cos
 import kotlin.math.pow
 
 class OpenChargeMapClient(
-    private val apiKey: String
+    private val apiKey: String,
+    private val operatorScoreCatalog: OcmOperatorScoreCatalog? = null
 ) {
     enum class SearchStage {
         FETCHING_POI,
@@ -216,7 +217,9 @@ class OpenChargeMapClient(
                     fromLon = userLongitude,
                     toLat = candidate.lat,
                     toLon = candidate.lon
-                )
+                ),
+                combinedCostScore = resolveCombinedCostScore(candidate.poi),
+                isFleetOperator = isFleetOperator(candidate.poi)
             )
             strictMatches.add(chargePoint.copy(accessSummary = "Public 24/7"))
 
@@ -414,6 +417,20 @@ class OpenChargeMapClient(
         if (normalized == "(business owner at location)") return true
         if (normalized.contains("tesla")) return true
         return false
+    }
+
+    private fun resolveCombinedCostScore(poi: JSONObject): Double? {
+        val operatorId = poi.optJSONObject("OperatorInfo")
+            ?.optInt("ID", -1)
+            ?.takeIf { it > 0 }
+        return operatorScoreCatalog?.findByOperatorId(operatorId)?.combinedCostScore
+    }
+
+    private fun isFleetOperator(poi: JSONObject): Boolean {
+        val operatorId = poi.optJSONObject("OperatorInfo")
+            ?.optInt("ID", -1)
+            ?.takeIf { it > 0 }
+        return operatorScoreCatalog?.findByOperatorId(operatorId)?.isFleetOperator == true
     }
 
     private fun fetchPoiByBoundingBox(box: BoundingBox): JSONArray {

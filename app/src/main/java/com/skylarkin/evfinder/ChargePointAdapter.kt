@@ -42,10 +42,16 @@ class ChargePointAdapter(
         fun bind(item: ChargePoint, onTap: (ChargePoint) -> Unit) {
             nameText.text = item.name
             addressText.text = item.address
+            val scoreText = when {
+                item.isFleetOperator -> "Fleet"
+                item.combinedCostScore == null -> "Unknown"
+                else -> String.format(Locale.US, "%.1f/10", item.combinedCostScore)
+            }
             metaText.text = String.format(
                 Locale.US,
-                "%.1f km | %s",
+                "%.1f km | Score: %s | %s",
                 item.distanceKm,
+                scoreText,
                 item.accessSummary
             )
 

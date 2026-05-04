@@ -9,5 +9,7 @@ data class ChargePoint(
     val distanceKm: Double,
     val usageCost: String,
     val accessSummary: String,
-    val directionCode: String
+    val directionCode: String,
+    val combinedCostScore: Double?,
+    val isFleetOperator: Boolean
 )

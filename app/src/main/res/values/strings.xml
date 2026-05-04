@@ -4,4 +4,5 @@
     <string name="title">Nearby EV Chargepoints</string>
     <string name="subtitle">Within 50 km, Type 2, public 24/7</string>
     <string name="retry">Search</string>
+    <string name="hide_unknown_fleet">Hide Unknown/Fleet</string>
 </resources>
