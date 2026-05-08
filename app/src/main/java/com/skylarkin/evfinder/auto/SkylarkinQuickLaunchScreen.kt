@@ -83,7 +83,6 @@ class SkylarkinQuickLaunchScreen(
                         .addItem(loadingRow)
                         .build()
                 )
-                .setLoading(true)
                 .build()
         }
 
@@ -292,41 +291,40 @@ class SkylarkinQuickLaunchScreen(
 
     private fun startSleepNavigation() {
         scope.launch {
-            val location = lastKnownLocation ?: awaitLastLocation()
-            if (location == null) {
-                carContext.mainExecutor.execute {
-                    CarToast.makeText(
-                        carContext,
-                        "Current location unavailable.",
-                        CarToast.LENGTH_SHORT
-                    ).show()
-                }
-                return@launch
-            }
+            runCatching {
+                val location = lastKnownLocation ?: awaitLastLocation()
+                    ?: throw IllegalStateException("Current location unavailable.")
 
-            lastKnownLocation = location
-            val nearest = runCatching {
+                lastKnownLocation = location
                 sleepSpotClient.findNearestSleepSpot(
                     userLatitude = location.latitude,
                     userLongitude = location.longitude,
                     requireShowers = requireShowers
                 )
-            }.getOrNull()
-
-            carContext.mainExecutor.execute {
-                if (nearest == null) {
-                    val criteria = if (requireShowers) {
-                        "free, overnight, open-today, shower"
+            }.onSuccess { nearest ->
+                carContext.mainExecutor.execute {
+                    if (nearest == null) {
+                        val criteria = if (requireShowers) {
+                            "free, overnight, open-today, shower"
+                        } else {
+                            "free, overnight, open-today"
+                        }
+                        CarToast.makeText(
+                            carContext,
+                            "No OSM sleep spot matched ($criteria).",
+                            CarToast.LENGTH_SHORT
+                        ).show()
                     } else {
-                        "free, overnight, open-today"
+                        navigateToCoordinates(nearest.latitude, nearest.longitude, nearest.name)
                     }
+                }
+            }.onFailure { error ->
+                carContext.mainExecutor.execute {
                     CarToast.makeText(
                         carContext,
-                        "No OSM sleep spot matched ($criteria).",
+                        "Sleep lookup failed: ${error.message ?: "unknown error"}",
                         CarToast.LENGTH_SHORT
                     ).show()
-                } else {
-                    navigateToCoordinates(nearest.latitude, nearest.longitude, nearest.name)
                 }
             }
         }
