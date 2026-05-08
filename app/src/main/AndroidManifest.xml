@@ -31,6 +31,9 @@
         <service
             android:name=".auto.SkylarkinCarAppService"
             android:exported="true">
+            <meta-data
+                android:name="androidx.car.app.minCarApiLevel"
+                android:value="1" />
             <intent-filter>
                 <action android:name="androidx.car.app.CarAppService" />
                 <category android:name="androidx.car.app.category.POI" />
