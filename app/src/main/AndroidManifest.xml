@@ -14,6 +14,10 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SkylarkinEvFinder">
         <meta-data
+            android:name="androidx.car.app.minCarApiLevel"
+            android:value="1" />
+
+        <meta-data
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
 
@@ -31,9 +35,6 @@
         <service
             android:name=".auto.SkylarkinCarAppService"
             android:exported="true">
-            <meta-data
-                android:name="androidx.car.app.minCarApiLevel"
-                android:value="1" />
             <intent-filter>
                 <action android:name="androidx.car.app.CarAppService" />
                 <category android:name="androidx.car.app.category.POI" />
