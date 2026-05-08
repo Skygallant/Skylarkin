@@ -362,13 +362,35 @@ class SkylarkinQuickLaunchScreen(
     }
 
     private fun matchesGeneralDirection(directionCode: String, cardinal: String): Boolean {
-        val code = directionCode.uppercase(Locale.US)
+        val bearing = directionCodeToBearing(directionCode) ?: return false
         return when (cardinal) {
-            "N" -> code in setOf("N", "NNE", "NNW", "NE", "NW")
-            "S" -> code in setOf("S", "SSE", "SSW", "SE", "SW")
-            "E" -> code in setOf("E", "ENE", "ESE", "NE", "SE")
-            "W" -> code in setOf("W", "WNW", "WSW", "NW", "SW")
+            "N" -> bearing >= 315.0 || bearing < 45.0
+            "E" -> bearing >= 45.0 && bearing < 135.0
+            "S" -> bearing >= 135.0 && bearing < 225.0
+            "W" -> bearing >= 225.0 && bearing < 315.0
             else -> false
+        }
+    }
+
+    private fun directionCodeToBearing(directionCode: String): Double? {
+        return when (directionCode.uppercase(Locale.US)) {
+            "N" -> 0.0
+            "NNE" -> 22.5
+            "NE" -> 45.0
+            "ENE" -> 67.5
+            "E" -> 90.0
+            "ESE" -> 112.5
+            "SE" -> 135.0
+            "SSE" -> 157.5
+            "S" -> 180.0
+            "SSW" -> 202.5
+            "SW" -> 225.0
+            "WSW" -> 247.5
+            "W" -> 270.0
+            "WNW" -> 292.5
+            "NW" -> 315.0
+            "NNW" -> 337.5
+            else -> null
         }
     }
 

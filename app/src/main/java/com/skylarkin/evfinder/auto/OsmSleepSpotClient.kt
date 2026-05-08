@@ -27,6 +27,9 @@ class OsmSleepSpotClient {
     private companion object {
         const val OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
         val RADIUS_STEPS_METERS = intArrayOf(20_000, 50_000, 100_000)
+        const val ROAD_DENSITY_RADIUS_METERS = 700
+        const val MAX_DENSITY_CHECK_CANDIDATES = 24
+        const val ROAD_DENSITY_PENALTY_KM = 0.45
     }
 
     suspend fun findNearestSleepSpot(
@@ -36,26 +39,72 @@ class OsmSleepSpotClient {
     ): OsmSleepSpot? {
         return withContext(Dispatchers.IO) {
             for (radius in RADIUS_STEPS_METERS) {
-                val nearest = runCatching {
-                    findNearestWithinRadius(userLatitude, userLongitude, radius, requireShowers)
+                val strictNearest = runCatching {
+                    findNearestStrictWithinRadius(
+                        userLatitude = userLatitude,
+                        userLongitude = userLongitude,
+                        radiusMeters = radius,
+                        requireShowers = requireShowers
+                    )
                 }.getOrNull()
-                if (nearest != null) return@withContext nearest
+                if (strictNearest != null) return@withContext strictNearest
+
+                val fallbackNearest = runCatching {
+                    findNearestNatureWithinRadius(
+                        userLatitude = userLatitude,
+                        userLongitude = userLongitude,
+                        radiusMeters = radius,
+                        requireShowers = requireShowers
+                    )
+                }.getOrNull()
+                if (fallbackNearest != null) return@withContext fallbackNearest
             }
             null
         }
     }
 
-    private fun findNearestWithinRadius(
+    private fun findNearestStrictWithinRadius(
         userLatitude: Double,
         userLongitude: Double,
         radiusMeters: Int,
         requireShowers: Boolean
     ): OsmSleepSpot? {
         val payload = "data=" + URLEncoder.encode(
-            buildOverpassQuery(userLatitude, userLongitude, radiusMeters),
+            buildStrictOverpassQuery(userLatitude, userLongitude, radiusMeters, requireShowers),
             Charsets.UTF_8.name()
         )
 
+        val elements = fetchOverpassElements(payload)
+        val candidates = extractStrictCandidates(
+            elements = elements,
+            userLatitude = userLatitude,
+            userLongitude = userLongitude,
+            requireShowers = requireShowers
+        )
+        return rankBySecludedScore(userLatitude, userLongitude, candidates)
+    }
+
+    private fun findNearestNatureWithinRadius(
+        userLatitude: Double,
+        userLongitude: Double,
+        radiusMeters: Int,
+        requireShowers: Boolean
+    ): OsmSleepSpot? {
+        val payload = "data=" + URLEncoder.encode(
+            buildNatureOverpassQuery(userLatitude, userLongitude, radiusMeters),
+            Charsets.UTF_8.name()
+        )
+        val elements = fetchOverpassElements(payload)
+        val candidates = extractNatureCandidates(
+            elements = elements,
+            userLatitude = userLatitude,
+            userLongitude = userLongitude,
+            requireShowers = requireShowers
+        )
+        return rankBySecludedScore(userLatitude, userLongitude, candidates)
+    }
+
+    private fun fetchOverpassElements(payload: String): JSONArray {
         val connection = (URL(OVERPASS_ENDPOINT).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             doOutput = true
@@ -70,7 +119,6 @@ class OsmSleepSpotClient {
             connection.outputStream.use { output ->
                 output.write(payload.toByteArray(Charsets.UTF_8))
             }
-
             val stream = if (connection.responseCode in 200..299) {
                 connection.inputStream
             } else {
@@ -84,19 +132,86 @@ class OsmSleepSpotClient {
         if (connection.responseCode !in 200..299) {
             throw IllegalStateException("Overpass error ${connection.responseCode}: $responseText")
         }
+        return JSONObject(responseText).optJSONArray("elements") ?: JSONArray()
+    }
 
-        val elements = JSONObject(responseText).optJSONArray("elements") ?: JSONArray()
+    private fun buildStrictOverpassQuery(
+        latitude: Double,
+        longitude: Double,
+        radiusMeters: Int,
+        requireShowers: Boolean
+    ): String {
+        val showerFilter = if (requireShowers) """["shower"~"^(yes|designated|customers|public)$"]""" else ""
+        val lat = String.format(Locale.US, "%.6f", latitude)
+        val lon = String.format(Locale.US, "%.6f", longitude)
+        return """
+            [out:json][timeout:25];
+            (
+              nwr(around:$radiusMeters,$lat,$lon)["amenity"="parking"]["overnight"~"^(yes|designated|permissive)$"]$showerFilter["fee"~"^(no|free|0)$"];
+              nwr(around:$radiusMeters,$lat,$lon)["tourism"~"^(camp_site|caravan_site|motorhome_site)$"]$showerFilter["fee"~"^(no|free|0)$"];
+            );
+            out center tags;
+        """.trimIndent()
+    }
+
+    private fun buildNatureOverpassQuery(latitude: Double, longitude: Double, radiusMeters: Int): String {
+        val lat = String.format(Locale.US, "%.6f", latitude)
+        val lon = String.format(Locale.US, "%.6f", longitude)
+        return """
+            [out:json][timeout:25];
+            (
+              nwr(around:$radiusMeters,$lat,$lon)["tourism"~"^(camp_site|caravan_site|wilderness_hut|picnic_site)$"];
+              nwr(around:$radiusMeters,$lat,$lon)["leisure"="nature_reserve"];
+              nwr(around:$radiusMeters,$lat,$lon)["natural"~"^(beach|wood|heath|scrub)$"];
+              nwr(around:$radiusMeters,$lat,$lon)["amenity"="shelter"];
+            );
+            out center tags;
+        """.trimIndent()
+    }
+
+    private fun extractStrictCandidates(
+        elements: JSONArray,
+        userLatitude: Double,
+        userLongitude: Double,
+        requireShowers: Boolean
+    ): List<OsmSleepSpot> {
         val candidates = mutableListOf<OsmSleepSpot>()
         val seenKeys = HashSet<String>()
-
         for (i in 0 until elements.length()) {
             val element = elements.optJSONObject(i) ?: continue
             val tags = element.optJSONObject("tags") ?: JSONObject()
-
+            if (!isPubliclyAccessible(tags)) continue
             if (!isFree(tags)) continue
             if (requireShowers && !hasShowerAccess(tags)) continue
             if (!supportsOvernight(tags)) continue
             if (!isOpenToday(tags)) continue
+            val latLon = extractLatLon(element) ?: continue
+            val lat = latLon.first
+            val lon = latLon.second
+            val name = elementName(tags)
+            val dedupeKey = "${name.lowercase(Locale.US)}|${formatCoord(lat)}|${formatCoord(lon)}"
+            if (!seenKeys.add(dedupeKey)) continue
+            val distance = haversineDistanceKm(userLatitude, userLongitude, lat, lon)
+            candidates.add(OsmSleepSpot(name, lat, lon, distance))
+        }
+        return candidates
+    }
+
+    private fun extractNatureCandidates(
+        elements: JSONArray,
+        userLatitude: Double,
+        userLongitude: Double,
+        requireShowers: Boolean
+    ): List<OsmSleepSpot> {
+        val candidates = mutableListOf<OsmSleepSpot>()
+        val seenKeys = HashSet<String>()
+        for (i in 0 until elements.length()) {
+            val element = elements.optJSONObject(i) ?: continue
+            val tags = element.optJSONObject("tags") ?: JSONObject()
+            if (!isPubliclyAccessible(tags)) continue
+            if (requireShowers && !hasShowerAccess(tags)) continue
+            if (!isOpenToday(tags)) continue
+            if (!supportsOvernight(tags) && !looksLikeNatureSpot(tags)) continue
 
             val latLon = extractLatLon(element) ?: continue
             val lat = latLon.first
@@ -104,32 +219,52 @@ class OsmSleepSpotClient {
             val name = elementName(tags)
             val dedupeKey = "${name.lowercase(Locale.US)}|${formatCoord(lat)}|${formatCoord(lon)}"
             if (!seenKeys.add(dedupeKey)) continue
-
             val distance = haversineDistanceKm(userLatitude, userLongitude, lat, lon)
-            candidates.add(
-                OsmSleepSpot(
-                    name = name,
-                    latitude = lat,
-                    longitude = lon,
-                    distanceKm = distance
-                )
-            )
+            candidates.add(OsmSleepSpot(name, lat, lon, distance))
         }
-
-        return candidates.minByOrNull { it.distanceKm }
+        return candidates
     }
 
-    private fun buildOverpassQuery(latitude: Double, longitude: Double, radiusMeters: Int): String {
+    private fun rankBySecludedScore(
+        userLatitude: Double,
+        userLongitude: Double,
+        candidates: List<OsmSleepSpot>
+    ): OsmSleepSpot? {
+        if (candidates.isEmpty()) return null
+
+        val shortlist = candidates
+            .sortedBy { it.distanceKm }
+            .take(MAX_DENSITY_CHECK_CANDIDATES)
+
+        val withScores = shortlist.map { spot ->
+            val roads = runCatching {
+                countNearbyRoads(
+                    latitude = spot.latitude,
+                    longitude = spot.longitude,
+                    radiusMeters = ROAD_DENSITY_RADIUS_METERS
+                )
+            }.getOrDefault(0)
+            val score = spot.distanceKm + (roads * ROAD_DENSITY_PENALTY_KM)
+            score to spot
+        }
+
+        return withScores.minByOrNull { it.first }?.second
+            ?: candidates.minByOrNull { haversineDistanceKm(userLatitude, userLongitude, it.latitude, it.longitude) }
+    }
+
+    private fun countNearbyRoads(latitude: Double, longitude: Double, radiusMeters: Int): Int {
         val lat = String.format(Locale.US, "%.6f", latitude)
         val lon = String.format(Locale.US, "%.6f", longitude)
-        return """
-            [out:json][timeout:25];
+        val query = """
+            [out:json][timeout:20];
             (
-              nwr(around:$radiusMeters,$lat,$lon)["amenity"="parking"]["overnight"~"^(yes|designated|permissive)$"]["shower"~"^(yes|designated|customers|public)$"]["fee"~"^(no|free|0)$"];
-              nwr(around:$radiusMeters,$lat,$lon)["tourism"~"^(camp_site|caravan_site|motorhome_site)$"]["shower"~"^(yes|designated|customers|public)$"]["fee"~"^(no|free|0)$"];
+              way(around:$radiusMeters,$lat,$lon)["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|service)$"];
             );
-            out center tags;
+            out ids;
         """.trimIndent()
+        val payload = "data=" + URLEncoder.encode(query, Charsets.UTF_8.name())
+        val elements = fetchOverpassElements(payload)
+        return elements.length()
     }
 
     private fun extractLatLon(element: JSONObject): Pair<Double, Double>? {
@@ -168,6 +303,25 @@ class OsmSleepSpotClient {
     private fun hasShowerAccess(tags: JSONObject): Boolean {
         val shower = tags.optString("shower", "").lowercase(Locale.US)
         return shower in setOf("yes", "designated", "customers", "public")
+    }
+
+    private fun isPubliclyAccessible(tags: JSONObject): Boolean {
+        val access = tags.optString("access", "").lowercase(Locale.US)
+        if (access in setOf("private", "customers", "permit")) return false
+        val motorVehicle = tags.optString("motor_vehicle", "").lowercase(Locale.US)
+        if (motorVehicle == "no") return false
+        return true
+    }
+
+    private fun looksLikeNatureSpot(tags: JSONObject): Boolean {
+        val tourism = tags.optString("tourism", "").lowercase(Locale.US)
+        if (tourism in setOf("camp_site", "caravan_site", "wilderness_hut", "picnic_site", "motorhome_site")) return true
+        val leisure = tags.optString("leisure", "").lowercase(Locale.US)
+        if (leisure == "nature_reserve") return true
+        val natural = tags.optString("natural", "").lowercase(Locale.US)
+        if (natural in setOf("beach", "wood", "heath", "scrub")) return true
+        val amenity = tags.optString("amenity", "").lowercase(Locale.US)
+        return amenity == "shelter"
     }
 
     private fun supportsOvernight(tags: JSONObject): Boolean {
