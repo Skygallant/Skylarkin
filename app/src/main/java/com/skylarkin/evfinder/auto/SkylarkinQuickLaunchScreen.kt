@@ -290,12 +290,29 @@ class SkylarkinQuickLaunchScreen(
     }
 
     private fun startSleepNavigation() {
+        isLoading = true
+        loadingStatusText = "Searching sleep spots..."
+        errorMessage = null
+        invalidate()
+
         scope.launch {
             runCatching {
+                carContext.mainExecutor.execute {
+                    if (isLoading) {
+                        loadingStatusText = "Getting current location..."
+                        invalidate()
+                    }
+                }
                 val location = lastKnownLocation ?: awaitLastLocation()
                     ?: throw IllegalStateException("Current location unavailable.")
 
                 lastKnownLocation = location
+                carContext.mainExecutor.execute {
+                    if (isLoading) {
+                        loadingStatusText = "Finding nearest sleep spot..."
+                        invalidate()
+                    }
+                }
                 sleepSpotClient.findNearestSleepSpot(
                     userLatitude = location.latitude,
                     userLongitude = location.longitude,
@@ -303,6 +320,8 @@ class SkylarkinQuickLaunchScreen(
                 )
             }.onSuccess { nearest ->
                 carContext.mainExecutor.execute {
+                    isLoading = false
+                    loadingStatusText = "Preparing search..."
                     if (nearest == null) {
                         val criteria = if (requireShowers) {
                             "free, overnight, open-today, shower"
@@ -317,14 +336,18 @@ class SkylarkinQuickLaunchScreen(
                     } else {
                         navigateToCoordinates(nearest.latitude, nearest.longitude, nearest.name)
                     }
+                    invalidate()
                 }
             }.onFailure { error ->
                 carContext.mainExecutor.execute {
+                    isLoading = false
+                    loadingStatusText = "Preparing search..."
                     CarToast.makeText(
                         carContext,
                         "Sleep lookup failed: ${error.message ?: "unknown error"}",
                         CarToast.LENGTH_SHORT
                     ).show()
+                    invalidate()
                 }
             }
         }
