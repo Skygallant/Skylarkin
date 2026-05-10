@@ -28,8 +28,12 @@ class OsmSleepSpotClient {
         const val OVERPASS_ENDPOINT = "https://overpass-api.de/api/interpreter"
         val RADIUS_STEPS_METERS = intArrayOf(20_000, 50_000, 100_000)
         const val ROAD_DENSITY_RADIUS_METERS = 700
-        const val MAX_DENSITY_CHECK_CANDIDATES = 24
+        const val MAX_DENSITY_CHECK_CANDIDATES = 8
         const val ROAD_DENSITY_PENALTY_KM = 0.45
+        const val OVERPASS_CONNECT_TIMEOUT_MS = 10_000
+        const val OVERPASS_READ_TIMEOUT_MS = 10_000
+        const val ROAD_DENSITY_CONNECT_TIMEOUT_MS = 4_000
+        const val ROAD_DENSITY_READ_TIMEOUT_MS = 4_000
     }
 
     suspend fun findNearestSleepSpot(
@@ -74,7 +78,11 @@ class OsmSleepSpotClient {
             Charsets.UTF_8.name()
         )
 
-        val elements = fetchOverpassElements(payload)
+        val elements = fetchOverpassElements(
+            payload = payload,
+            connectTimeoutMs = OVERPASS_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = OVERPASS_READ_TIMEOUT_MS
+        )
         val candidates = extractStrictCandidates(
             elements = elements,
             userLatitude = userLatitude,
@@ -94,7 +102,11 @@ class OsmSleepSpotClient {
             buildNatureOverpassQuery(userLatitude, userLongitude, radiusMeters),
             Charsets.UTF_8.name()
         )
-        val elements = fetchOverpassElements(payload)
+        val elements = fetchOverpassElements(
+            payload = payload,
+            connectTimeoutMs = OVERPASS_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = OVERPASS_READ_TIMEOUT_MS
+        )
         val candidates = extractNatureCandidates(
             elements = elements,
             userLatitude = userLatitude,
@@ -104,15 +116,19 @@ class OsmSleepSpotClient {
         return rankBySecludedScore(userLatitude, userLongitude, candidates)
     }
 
-    private fun fetchOverpassElements(payload: String): JSONArray {
+    private fun fetchOverpassElements(
+        payload: String,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int
+    ): JSONArray {
         val connection = (URL(OVERPASS_ENDPOINT).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             doOutput = true
             setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
             setRequestProperty("Accept", "application/json")
             setRequestProperty("User-Agent", "Skylarkin/1.0 (Android Auto sleep lookup)")
-            connectTimeout = 20_000
-            readTimeout = 20_000
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
         }
 
         val responseText = try {
@@ -232,6 +248,7 @@ class OsmSleepSpotClient {
     ): OsmSleepSpot? {
         if (candidates.isEmpty()) return null
 
+        return runCatching {
         val shortlist = candidates
             .sortedBy { it.distanceKm }
             .take(MAX_DENSITY_CHECK_CANDIDATES)
@@ -250,6 +267,9 @@ class OsmSleepSpotClient {
 
         return withScores.minByOrNull { it.first }?.second
             ?: candidates.minByOrNull { haversineDistanceKm(userLatitude, userLongitude, it.latitude, it.longitude) }
+        }.getOrElse {
+            candidates.minByOrNull { haversineDistanceKm(userLatitude, userLongitude, it.latitude, it.longitude) }
+        }
     }
 
     private fun countNearbyRoads(latitude: Double, longitude: Double, radiusMeters: Int): Int {
@@ -263,7 +283,11 @@ class OsmSleepSpotClient {
             out ids;
         """.trimIndent()
         val payload = "data=" + URLEncoder.encode(query, Charsets.UTF_8.name())
-        val elements = fetchOverpassElements(payload)
+        val elements = fetchOverpassElements(
+            payload = payload,
+            connectTimeoutMs = ROAD_DENSITY_CONNECT_TIMEOUT_MS,
+            readTimeoutMs = ROAD_DENSITY_READ_TIMEOUT_MS
+        )
         return elements.length()
     }
 
