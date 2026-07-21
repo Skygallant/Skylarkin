@@ -15,14 +15,14 @@ val hasCompleteReleaseSigning = !releaseStoreFile.isNullOrBlank() &&
 
 android {
     namespace = "com.skylarkin.evfinder"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.skylarkin.evfinder"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 30
-        versionName = "0.30"
+        targetSdk = 36
+        versionCode = 31
+        versionName = "0.31"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
